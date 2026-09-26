@@ -317,3 +317,169 @@ fn regression_successful_transfer_still_works() {
     client.set_min_topup(&admin_b, &3_000_000i128);
     assert_eq!(client.get_min_topup(), 3_000_000i128);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Atomicity: propose_admin revert leaves storage clean
+//
+// Soroban transactions are fully atomic. If propose_admin reverts for any
+// reason (auth failure, invalid input, duplicate proposal) the storage write
+// of the pending proposal must also be rolled back. These tests verify that
+// every error path leaves get_admin_proposal() == None and that no half-written
+// state persists after a failed call.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// A failed propose_admin (wrong caller) must not leave any proposal in storage.
+///
+/// Simulates the scenario from issue #200: a transaction that would write
+/// pending_admin to storage before failing. Soroban atomicity ensures the
+/// write is rolled back; this test asserts the observable guarantee.
+#[test]
+fn propose_admin_revert_leaves_no_pending_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let target = Address::generate(&env);
+
+    let (_, client) = setup_vault(&env, &admin);
+
+    // No proposal exists initially
+    assert!(client.get_admin_proposal().is_none());
+
+    // Unauthorized call — would write to storage then fail (or fail at auth).
+    // Either way, storage must remain clean.
+    let result = client.try_propose_admin(&attacker, &target);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+    // Storage must be clean — no pending proposal leaked
+    assert!(client.get_admin_proposal().is_none());
+
+    // Admin is unchanged
+    assert_eq!(client.get_admin(), admin);
+}
+
+/// A failed propose_admin (duplicate proposal) must not overwrite the existing
+/// proposal with corrupted data.
+///
+/// The second call hits ProposalAlreadyExists *after* auth succeeds, verifying
+/// that the guard fires before any storage mutation occurs.
+#[test]
+fn propose_admin_duplicate_does_not_corrupt_existing_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let admin = Address::generate(&env);
+    let first_candidate = Address::generate(&env);
+    let second_candidate = Address::generate(&env);
+
+    let (_, client) = setup_vault(&env, &admin);
+
+    // First proposal succeeds and is stored
+    client.propose_admin(&admin, &first_candidate);
+    let original = client.get_admin_proposal().expect("proposal should exist");
+    assert_eq!(original.new_admin, first_candidate);
+
+    // Second proposal attempt reverts with ProposalAlreadyExists
+    let result = client.try_propose_admin(&admin, &second_candidate);
+    assert_eq!(result, Err(Ok(Error::ProposalAlreadyExists)));
+
+    // The original proposal must be untouched — no partial overwrite
+    let after = client.get_admin_proposal().expect("original proposal must still exist");
+    assert_eq!(after.new_admin, first_candidate);
+    assert_eq!(after.proposed_at, original.proposed_at);
+    assert_eq!(after.expires_at, original.expires_at);
+}
+
+/// A failed propose_admin (rotation to contract address) must not leave a
+/// pending proposal in storage.
+///
+/// InvalidNewAdmin is checked before the storage write so the write must
+/// never happen; this test makes the invariant explicit.
+#[test]
+fn propose_admin_invalid_target_leaves_no_pending_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let (_, client) = setup_vault(&env, &admin);
+
+    // Attempt to propose the contract address itself — must be rejected
+    let result = client.try_propose_admin(&admin, &client.address);
+    assert_eq!(result, Err(Ok(Error::InvalidNewAdmin)));
+
+    // No proposal must have been written
+    assert!(client.get_admin_proposal().is_none());
+    assert_eq!(client.get_admin(), admin);
+}
+
+/// Verifies write-and-emit atomicity: a successful propose_admin call must
+/// produce both a storage entry AND the corresponding event in the same
+/// transaction. If either is missing the call effectively reverted.
+///
+/// This guards against any future refactor that separates the write from
+/// the emit — both must succeed or neither persists.
+#[test]
+fn propose_admin_write_and_emit_are_atomic() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{IntoVal, Val, Vec};
+
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(2_000_000);
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let (_, client) = setup_vault(&env, &admin);
+
+    client.propose_admin(&admin, &new_admin);
+
+    // 1. Storage side: proposal must exist with correct fields
+    let proposal = client.get_admin_proposal().expect("proposal must be stored");
+    assert_eq!(proposal.new_admin, new_admin);
+    assert_eq!(proposal.proposed_at, 2_000_000);
+
+    // 2. Event side: admin_proposal_created must have been emitted
+    let topic = soroban_sdk::Symbol::new(&env, "admin_proposal_created");
+    let topic_val: Val = topic.clone().into_val(&env);
+    let all_events = env.events().all();
+    let event_found = (0..all_events.len()).any(|i| {
+        let (_, topics, _): (soroban_sdk::Address, Vec<Val>, Val) =
+            all_events.get(i).unwrap();
+        topics.get(0) == Some(topic_val.clone())
+    });
+    assert!(event_found, "admin_proposal_created event must be emitted in the same call as the storage write");
+
+    // 3. Atomicity: both are visible or the call would have returned an error.
+    //    The combination of Ok(()) return + proposal in storage + event present
+    //    proves write-and-emit completed atomically.
+    assert_eq!(client.get_admin(), admin, "admin must not change during propose");
+}
+
+/// Verifies that multiple sequential revert-inducing calls never accumulate
+/// stale proposals in storage.
+///
+/// Each failed call is independent; none should leave observable side effects.
+#[test]
+fn repeated_failed_propose_admin_calls_leave_clean_storage() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let (_, client) = setup_vault(&env, &admin);
+
+    let attackers: Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
+    let target = Address::generate(&env);
+
+    for attacker in &attackers {
+        let result = client.try_propose_admin(attacker, &target);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+        // After every failed attempt, storage must remain clean
+        assert!(
+            client.get_admin_proposal().is_none(),
+            "storage must be clean after failed propose_admin"
+        );
+        assert_eq!(client.get_admin(), admin);
+    }
+}

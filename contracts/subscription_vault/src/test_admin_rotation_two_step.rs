@@ -120,10 +120,22 @@ fn test_claim_admin_role_success() {
     let new_admin = Address::generate(&env);
 
     client.propose_admin(&admin, &new_admin);
+    advance_seconds(&env, 24 * 60 * 60);
     client.claim_admin_role(&new_admin);
 
     assert_eq!(client.get_admin(), new_admin);
     assert!(client.get_admin_proposal().is_none());
+}
+
+#[test]
+fn test_claim_admin_role_cooldown_active() {
+    let (env, client, _token, admin) = setup();
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin(&admin, &new_admin);
+    // Try to claim immediately without waiting for cooldown
+    let result = client.try_claim_admin_role(&new_admin);
+    assert_eq!(result, Err(Ok(Error::ProposalCooldownActive)));
 }
 
 #[test]
@@ -132,6 +144,7 @@ fn test_claim_admin_role_wrong_claimant() {
     let new_admin = Address::generate(&env);
 
     client.propose_admin(&admin, &new_admin);
+    advance_seconds(&env, 24 * 60 * 60);
     let impostor = Address::generate(&env);
     let result = client.try_claim_admin_role(&impostor);
     assert_eq!(result, Err(Ok(Error::InvalidClaimant)));
@@ -167,6 +180,7 @@ fn test_claim_admin_role_new_admin_can_operate() {
     let new_admin = Address::generate(&env);
 
     client.propose_admin(&admin, &new_admin);
+    advance_seconds(&env, 24 * 60 * 60);
     client.claim_admin_role(&new_admin);
 
     // New admin can perform admin operations
@@ -184,6 +198,7 @@ fn test_claim_admin_role_event_emitted() {
     let new_admin = Address::generate(&env);
 
     client.propose_admin(&admin, &new_admin);
+    advance_seconds(&env, 24 * 60 * 60);
     client.claim_admin_role(&new_admin);
 
     assert!(find_event_data(&env, &Symbol::new(&env, "admin_proposal_claimed")).is_some());
@@ -295,11 +310,13 @@ fn test_two_step_rotation_full_lifecycle() {
     assert!(client.get_admin_proposal().is_some());
 
     // Claim admin2
+    advance_seconds(&env, 24 * 60 * 60);
     client.claim_admin_role(&admin2);
     assert_eq!(client.get_admin(), admin2);
 
     // admin2 proposes admin3
     client.propose_admin(&admin2, &admin3);
+    advance_seconds(&env, 24 * 60 * 60);
     client.claim_admin_role(&admin3);
     assert_eq!(client.get_admin(), admin3);
 
@@ -338,6 +355,7 @@ fn test_admin_proposal_claimed_event_payload() {
     let new_admin = Address::generate(&env);
 
     client.propose_admin(&admin, &new_admin);
+    advance_seconds(&env, 24 * 60 * 60);
     client.claim_admin_role(&new_admin);
 
     let payload = find_event_data(&env, &Symbol::new(&env, "admin_proposal_claimed")).unwrap();
@@ -382,6 +400,7 @@ fn test_proposal_cannot_be_claimed_by_old_admin_after_immediate_rotation() {
     // However, the proposal still exists since we didn't cancel it.
     // But admin is already new_admin, and the proposal was for them.
     // They claim it, but it should be no-op effect (already admin).
+    advance_seconds(&env, 24 * 60 * 60);
     client.claim_admin_role(&new_admin);
     assert_eq!(client.get_admin(), new_admin);
 }

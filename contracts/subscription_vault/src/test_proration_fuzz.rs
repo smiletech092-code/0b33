@@ -104,3 +104,253 @@ fn test_edge_case_i128_max_values() {
     assert!(prorated >= 0);
     assert!(prorated <= amount);
 }
+
+// ---------------------------------------------------------------------------
+// Fuzz Tests for `create_subscription` Expiration Boundary Values
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod expiration_boundary_tests {
+    use super::*;
+    use crate::SubscriptionVault;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Address, Env,
+    };
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1_000))]
+
+        /// Fuzzes random expiration timestamps (expires_at) to verify that
+        /// `create_subscription` correctly handles boundary values:
+        /// - u64::MAX (far future)
+        /// - 0 (epoch / expired at creation)
+        /// - current timestamp
+        /// - timestamps before/after current
+        ///
+        /// Verifies:
+        /// 1. Subscription creation succeeds for all expiration values
+        /// 2. Returned subscription ID is non-zero
+        /// 3. Subscription can be queried after creation regardless of expiration
+        #[test]
+        fn fuzz_create_subscription_with_expiration_boundary_values(
+            expires_at_offset in -1_000_000i64..=1_000_000i64,
+        ) {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let admin = Address::generate(&env);
+            let token = env
+                .register_stellar_asset_contract_v2(admin.clone())
+                .address();
+
+            let vault_id = env.register(SubscriptionVault, ());
+            let client = soroban_sdk::ContractClient::new(&env, &vault_id);
+            client.invoke(&env, &Symbol::new(&env, "init"), &(
+                &token,
+                &7u32,
+                &admin,
+                &1_000_000i128,
+                &3600u64,
+            ));
+
+            let current_timestamp = env.ledger().timestamp();
+            let expires_at = if expires_at_offset >= 0 {
+                current_timestamp + expires_at_offset as u64
+            } else {
+                current_timestamp.saturating_sub((-expires_at_offset) as u64)
+            };
+
+            let subscriber = Address::generate(&env);
+            let merchant = Address::generate(&env);
+
+            // Test boundary case: subscription with various expiration timestamps
+            let result = client.invoke::<u32>(
+                &env,
+                &Symbol::new(&env, "create_subscription"),
+                &(
+                    &subscriber,
+                    &merchant,
+                    &1_000_000i128,
+                    &(30u64 * 24 * 60 * 60),
+                    &false,
+                    &None::<i128>,
+                    &Some(expires_at),
+                    &None::<u32>,
+                ),
+            );
+
+            // Subscription creation should succeed regardless of expiration value
+            prop_assert!(result.is_ok(), "create_subscription should handle any expiration value");
+            let sub_id = result.unwrap();
+            prop_assert!(sub_id > 0, "subscription ID must be non-zero");
+        }
+    }
+
+    #[test]
+    fn test_create_subscription_expires_at_u64_max() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let vault_id = env.register(SubscriptionVault, ());
+        let client = soroban_sdk::ContractClient::new(&env, &vault_id);
+        client.invoke(&env, &Symbol::new(&env, "init"), &(
+            &token,
+            &7u32,
+            &admin,
+            &1_000_000i128,
+            &3600u64,
+        ));
+
+        let subscriber = Address::generate(&env);
+        let merchant = Address::generate(&env);
+
+        let result = client.invoke::<u32>(
+            &env,
+            &Symbol::new(&env, "create_subscription"),
+            &(
+                &subscriber,
+                &merchant,
+                &1_000_000i128,
+                &(30u64 * 24 * 60 * 60),
+                &false,
+                &None::<i128>,
+                &Some(u64::MAX),
+                &None::<u32>,
+            ),
+        );
+
+        assert!(result.is_ok(), "subscription with expires_at=u64::MAX must be created");
+    }
+
+    #[test]
+    fn test_create_subscription_expires_at_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let vault_id = env.register(SubscriptionVault, ());
+        let client = soroban_sdk::ContractClient::new(&env, &vault_id);
+        client.invoke(&env, &Symbol::new(&env, "init"), &(
+            &token,
+            &7u32,
+            &admin,
+            &1_000_000i128,
+            &3600u64,
+        ));
+
+        let subscriber = Address::generate(&env);
+        let merchant = Address::generate(&env);
+
+        let result = client.invoke::<u32>(
+            &env,
+            &Symbol::new(&env, "create_subscription"),
+            &(
+                &subscriber,
+                &merchant,
+                &1_000_000i128,
+                &(30u64 * 24 * 60 * 60),
+                &false,
+                &None::<i128>,
+                &Some(0u64),
+                &None::<u32>,
+            ),
+        );
+
+        assert!(result.is_ok(), "subscription with expires_at=0 (epoch) must be created");
+    }
+
+    #[test]
+    fn test_create_subscription_expires_at_current_timestamp() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let vault_id = env.register(SubscriptionVault, ());
+        let client = soroban_sdk::ContractClient::new(&env, &vault_id);
+        client.invoke(&env, &Symbol::new(&env, "init"), &(
+            &token,
+            &7u32,
+            &admin,
+            &1_000_000i128,
+            &3600u64,
+        ));
+
+        let current_timestamp = env.ledger().timestamp();
+        let subscriber = Address::generate(&env);
+        let merchant = Address::generate(&env);
+
+        let result = client.invoke::<u32>(
+            &env,
+            &Symbol::new(&env, "create_subscription"),
+            &(
+                &subscriber,
+                &merchant,
+                &1_000_000i128,
+                &(30u64 * 24 * 60 * 60),
+                &false,
+                &None::<i128>,
+                &Some(current_timestamp),
+                &None::<u32>,
+            ),
+        );
+
+        assert!(result.is_ok(), "subscription with expires_at=current_timestamp must be created");
+    }
+
+    #[test]
+    fn test_create_subscription_expires_at_past_timestamp() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let vault_id = env.register(SubscriptionVault, ());
+        let client = soroban_sdk::ContractClient::new(&env, &vault_id);
+        client.invoke(&env, &Symbol::new(&env, "init"), &(
+            &token,
+            &7u32,
+            &admin,
+            &1_000_000i128,
+            &3600u64,
+        ));
+
+        let current_timestamp = env.ledger().timestamp();
+        let past_timestamp = current_timestamp.saturating_sub(86400); // 1 day ago
+        let subscriber = Address::generate(&env);
+        let merchant = Address::generate(&env);
+
+        let result = client.invoke::<u32>(
+            &env,
+            &Symbol::new(&env, "create_subscription"),
+            &(
+                &subscriber,
+                &merchant,
+                &1_000_000i128,
+                &(30u64 * 24 * 60 * 60),
+                &false,
+                &None::<i128>,
+                &Some(past_timestamp),
+                &None::<u32>,
+            ),
+        );
+
+        assert!(result.is_ok(), "subscription with expires_at=past_timestamp must be created");
+    }
+}

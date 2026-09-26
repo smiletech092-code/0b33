@@ -16,7 +16,8 @@ Setting `fee_bps = 0` disables fee collection with no extra code-path branches; 
 On every successful charge (interval, usage, or one-off):
 
 ```
-fee        = gross * fee_bps / 10_000   (integer floor division)
+fee        = max(gross * fee_bps / 10_000, 1)   (when fee_bps > 0 and treasury is set)
+fee        = 0                                    (when fee_bps = 0 or no treasury)
 net        = gross - fee
 ```
 
@@ -28,6 +29,22 @@ The subscriber's prepaid balance is debited by `gross`. The split is:
 | Treasury  | `fee`  |
 
 **Conservation:** `gross == net + fee` holds on every charge. Rounding truncates toward zero; any remainder (from non-divisible amounts) stays with the merchant.
+
+### Minimum-fee floor
+
+When `fee_bps > 0` and a treasury address is configured, the raw integer division `gross * fee_bps / 10_000` may round to `0` for very small charge amounts (specifically when `gross < 10_000 / fee_bps`). If this happens, the contract enforces a **minimum fee of 1 base unit** rather than allowing the full gross to flow to the merchant. The `gross == net + fee` invariant is preserved because `net = gross - fee(floored)`.
+
+**Example** (fee_bps = 10, i.e. 0.1%):
+
+| gross | raw fee | floored fee | net |
+|-------|---------|-------------|-----|
+| 1     | 0       | **1**       | 0   |
+| 9     | 0       | **1**       | 8   |
+| 10    | 0       | **1**       | 9   |
+| 100   | 1       | 1           | 99  |
+| 10000 | 10      | 10          | 9990|
+
+The floor means a subscription with a very small `amount` will always pay at least 1 base unit of fee per charge when a protocol fee is active. Merchants setting up subscriptions below this threshold should be aware that the effective fee rate may be higher than `fee_bps` basis points for small amounts.
 
 ## Fallback: fee_bps > 0 but no treasury
 
@@ -62,6 +79,7 @@ If `fee_bps > 0` but no treasury address is stored (e.g. `set_protocol_fee` was 
 - Treasury balance accrues identically to merchant balances and is subject to the same withdrawal controls.
 - `fee_bps > 10_000` is rejected at configuration time (`InvalidInput`).
 - The fee is computed from the gross charge amount, not from the merchant's net — preventing fee-on-fee compounding.
+- **Minimum-fee floor prevents fee evasion:** when `fee_bps > 0` and a treasury is set, the contract enforces `fee ≥ 1` even if `gross * fee_bps / 10_000` rounds to zero. A charge amount of 1 base unit will always yield a fee of 1 base unit when a protocol fee is active. See the Minimum-fee floor section above for the full table.
 
 ## Coupons and Discounts (Issue #474)
 

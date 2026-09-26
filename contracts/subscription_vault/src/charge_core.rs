@@ -109,8 +109,10 @@ struct FeeConversion {
 /// - Conversion would round to zero (precision loss guard).
 fn convert_fee(
     env: &Env,
+    merchant: &Address,
     source_token: &Address,
     fee_amount: i128,
+    price_cache: Option<&mut Vec<(Address, Address, u128)>>,
 ) -> FeeConversion {
     let fee_token_opt = crate::admin::get_fee_token(env);
     let fee_token = match fee_token_opt {
@@ -133,8 +135,27 @@ fn convert_fee(
         };
     }
 
-    match dispatch_price(env, &oracle_config, source_token, &fee_token) {
+    // Reuse a previously-dispatched price for the same (merchant, token) pair
+    // within this batch so the oracle is not queried redundantly.
+    let cached = price_cache.as_ref().and_then(|cache| {
+        cache
+            .iter()
+            .find(|(m, t, _)| m == merchant && t == source_token)
+            .map(|(_, _, p)| *p)
+    });
+
+    let price_result = match cached {
+        Some(p) => Ok(p),
+        None => dispatch_price(env, &oracle_config, source_token, &fee_token),
+    };
+
+    match price_result {
         Ok(price) => {
+            if cached.is_none() {
+                if let Some(cache) = price_cache {
+                    cache.push((merchant.clone(), source_token.clone(), price));
+                }
+            }
             let converted = (fee_amount as u128)
                 .checked_mul(price)
                 .and_then(|v| v.checked_div(PRICE_SCALE))
@@ -163,18 +184,60 @@ fn convert_fee(
 }
 
 /// Performs a single interval-based charge with optional replay protection.
+///
+/// `merchant_cache` lets callers that charge many subscriptions in one call
+/// (e.g. `execute_batch_charge`) reuse the paused/vacation lookup for a
+/// merchant across every subscription that shares it, instead of re-reading
+/// `DataKey::MerchantPaused`/`DataKey::MerchantVacation` from storage on
+/// every iteration. Pass `None` for single-subscription charge paths.
 pub fn charge_one(
     env: &Env,
     subscription_id: u32,
     now: u64,
     idempotency_key: Option<soroban_sdk::BytesN<32>>,
     admin_config: Option<&crate::admin::CachedAdminConfig>,
+    mut merchant_cache: Option<&mut soroban_sdk::Map<Address, (bool, bool)>>,
 ) -> Result<ChargeExecutionResult, Error> {
+    // ── CRITICAL: Atomic emergency stop check ────────────────────────────────
+    // Re-check emergency stop on every iteration to prevent in-flight batch_charge
+    // from completing when emergency_stop is triggered mid-execution.
+    // This fixes the race condition where the flag is only checked at entry-point.
+    if crate::admin::read_config(env, &crate::types::DataKey::EmergencyStop).unwrap_or(false) {
+        return Err(charge_fail(
+            env,
+            subscription_id,
+            crate::types::Error::EmergencyStopActive,
+            0,
+            now,
+        ));
+    }
+
     let mut sub = get_subscription(env, subscription_id)
         .map_err(|e| charge_fail(env, subscription_id, e, 0, now))?;
 
+    // Merchant pause/vacation status — cached per merchant within a batch so
+    // subscriptions sharing a merchant don't each re-read the same storage.
+    let (merchant_paused, merchant_in_vacation) = match merchant_cache.as_deref_mut() {
+        Some(cache) => {
+            if let Some(cached) = cache.get(sub.merchant.clone()) {
+                cached
+            } else {
+                let status = (
+                    crate::merchant::get_merchant_paused(env, sub.merchant.clone()),
+                    crate::merchant::is_merchant_in_vacation(env, &sub.merchant, now),
+                );
+                cache.set(sub.merchant.clone(), status);
+                status
+            }
+        }
+        None => (
+            crate::merchant::get_merchant_paused(env, sub.merchant.clone()),
+            crate::merchant::is_merchant_in_vacation(env, &sub.merchant, now),
+        ),
+    };
+
     // Merchant pause guard — mirrors charge_usage_one enforcement
-    if crate::merchant::get_merchant_paused(env, sub.merchant.clone()) {
+    if merchant_paused {
         return Err(charge_fail(
             env,
             subscription_id,
@@ -185,7 +248,7 @@ pub fn charge_one(
     }
 
     // Merchant vacation guard — block charges during vacation window
-    if crate::merchant::is_merchant_in_vacation(env, &sub.merchant, now) {
+    if merchant_in_vacation {
         return Err(charge_fail(
             env,
             subscription_id,
@@ -256,7 +319,7 @@ pub fn charge_one(
     // Discount is applied to the oracle-resolved gross amount. The fee split and
     // merchant credit then operate on `charge_amount` (the post-discount payable).
     // This preserves: Gross = Discount + Merchant Net + Treasury Fee.
-    let (charge_amount, _discount_amount) = crate::coupon::apply_discount_at_charge(
+    let (mut charge_amount, _discount_amount) = crate::coupon::apply_discount_at_charge(
         env,
         subscription_id,
         now,
@@ -264,8 +327,17 @@ pub fn charge_one(
         charge_amount,
     );
 
+    // ── Proration for partial first billing period ───────────────────────────
+    // If proration is enabled and this is the first charge (last_payment_timestamp == start_time),
+    // scale the charge by the elapsed time within the first interval.
+    if sub.proration_enabled && sub.last_payment_timestamp == sub.start_time {
+        let elapsed_seconds = now.saturating_sub(sub.start_time);
+        charge_amount = calculate_prorated_first_charge(charge_amount, sub.interval_seconds, elapsed_seconds)
+            .map_err(|e| charge_fail(env, subscription_id, e, charge_amount, now))?;
+    }
+
     if let Some(cap) = sub.lifetime_cap {
-        if sub.lifetime_charged >= cap {
+        if crate::subscription::lifetime_cap_reached(cap, sub.lifetime_charged) {
             if sub.status != SubscriptionStatus::Cancelled {
                 transition_to(&mut sub.status, SubscriptionStatus::Cancelled)?;
                 write_subscription(env, subscription_id, &sub);
@@ -398,7 +470,7 @@ pub fn charge_one(
     if let Some(ref k) = idempotency_key {
         let hashed = crate::idempotency::hash_idem_key(
             env,
-            crate::nonce::DOMAIN_CHARGE_INTERVAL,
+            crate::nonce::DOMAIN_CHARGE_INTERVAL.as_u32(),
             subscription_id,
             k,
         );
@@ -437,7 +509,7 @@ pub fn charge_one(
 
     // -- Lifetime cap pre-check -----------------------------------------------
     if let Some(cap) = sub.lifetime_cap {
-        let remaining = if sub.lifetime_charged >= cap {
+        let remaining = if crate::subscription::lifetime_cap_reached(cap, sub.lifetime_charged) {
             0
         } else {
             safe_sub(cap, sub.lifetime_charged)?
@@ -486,10 +558,16 @@ pub fn charge_one(
             // exactly in the charge token and prevents 1-unit dust from remaining
             // in the vault. Converted fees (fee-token overrides) are handled
             // separately and do not affect the source-token accounting invariant.
+            //
+            // Minimum-fee floor: if fee_bps > 0 and a treasury is configured but
+            // the integer division rounds to 0 (charge_amount < 10_000 / fee_bps),
+            // we enforce a minimum fee of 1 base unit. This prevents fee evasion
+            // via very small charge amounts. The floor is only applied when there
+            // is an active treasury; if no treasury is set the fee is always 0.
             let (merchant_amount, fee_amount) = if fee_bps > 0 {
                 if let Some(ref _t) = treasury_opt {
-                    let fee = charge_amount * fee_bps as i128 / 10_000i128;
-                    let net = charge_amount - fee;
+                    let fee = (charge_amount * fee_bps as i128 / 10_000i128).max(1);
+                    let net = safe_sub(charge_amount, fee)?;
                     (net, fee)
                 } else {
                     (charge_amount, 0i128)
@@ -523,7 +601,13 @@ pub fn charge_one(
             }
 
             let conversion = if fee_amount > 0 {
-                Some(convert_fee(env, &sub.token, fee_amount))
+                Some(convert_fee(
+                    env,
+                    &sub.merchant,
+                    &sub.token,
+                    fee_amount,
+                    price_cache.as_deref_mut(),
+                ))
             } else {
                 None
             };
@@ -577,7 +661,7 @@ pub fn charge_one(
             // Check if cap is now exactly reached -- auto-cancel
             let cap_reached = sub
                 .lifetime_cap
-                .map(|cap| sub.lifetime_charged >= cap)
+                .map(|cap| crate::subscription::lifetime_cap_reached(cap, sub.lifetime_charged))
                 .unwrap_or(false);
 
             if cap_reached {
@@ -625,6 +709,7 @@ pub fn charge_one(
                 subscription_id,
                 charge_amount,
                 sub.merchant.clone(),
+                sub.token.clone(),
                 BillingChargeKind::Interval,
                 next_allowed.saturating_sub(sub.interval_seconds),
                 now,
@@ -650,11 +735,11 @@ pub fn charge_one(
             if let Some(k) = idempotency_key {
                 let hashed = crate::idempotency::hash_idem_key(
                     env,
-                    crate::nonce::DOMAIN_CHARGE_INTERVAL,
+                    crate::nonce::DOMAIN_CHARGE_INTERVAL.as_u32(),
                     subscription_id,
                     &k,
                 );
-                crate::idempotency::push_key(env, subscription_id, &hashed);
+                crate::idempotency::push_key(env, subscription_id, &hashed, now);
             }
 
             env.events().publish(
@@ -664,7 +749,7 @@ pub fn charge_one(
                     subscriber: sub.subscriber.clone(),
                     merchant: sub.merchant.clone(),
                     token: sub.token.clone(),
-                    amount: charge_amount,
+                    amount: merchant_amount,
                     lifetime_charged: sub.lifetime_charged,
                     timestamp: now,
                     period_start,
@@ -809,6 +894,20 @@ pub fn charge_usage_one(
     usage_amount: i128,
     reference: String,
 ) -> Result<UsageChargeResult, Error> {
+    // ── CRITICAL: Atomic emergency stop check ────────────────────────────────
+    // Re-check emergency stop on every iteration to prevent in-flight charging
+    // operations from completing when emergency_stop is triggered mid-execution.
+    let now = env.ledger().timestamp();
+    if crate::admin::read_config(env, &crate::types::DataKey::EmergencyStop).unwrap_or(false) {
+        return Err(charge_fail(
+            env,
+            subscription_id,
+            crate::types::Error::EmergencyStopActive,
+            0,
+            now,
+        ));
+    }
+
     let mut sub = get_subscription(env, subscription_id)
         .map_err(|e| charge_fail(env, subscription_id, e, 0, env.ledger().timestamp()))?;
     let merchant = sub.merchant.clone();
@@ -890,7 +989,7 @@ pub fn charge_usage_one(
     }
 
     if let Some(cap) = sub.lifetime_cap {
-        if sub.lifetime_charged >= cap {
+        if crate::subscription::lifetime_cap_reached(cap, sub.lifetime_charged) {
             if sub.status != SubscriptionStatus::Cancelled {
                 transition_to(&mut sub.status, SubscriptionStatus::Cancelled)?;
                 write_subscription(env, subscription_id, &sub);
@@ -1115,8 +1214,10 @@ pub fn charge_usage_one(
             let treasury_opt = crate::admin::get_treasury(env);
             let (merchant_amount, fee_amount) = if fee_bps > 0 {
                 if let Some(ref _t) = treasury_opt {
-                    let fee = usage_amount * fee_bps as i128 / 10_000i128;
-                    (usage_amount - fee, fee)
+                    // Minimum-fee floor: see charge_one for rationale.
+                    let fee = (usage_amount * fee_bps as i128 / 10_000i128).max(1);
+                    let net = safe_sub(usage_amount, fee)?;
+                    (net, fee)
                 } else {
                     (usage_amount, 0i128)
                 }
@@ -1141,7 +1242,7 @@ pub fn charge_usage_one(
             }
 
             let conversion = if fee_amount > 0 {
-                Some(convert_fee(env, &sub.token, fee_amount))
+                Some(convert_fee(env, &sub.merchant, &sub.token, fee_amount, None))
             } else {
                 None
             };
@@ -1178,7 +1279,7 @@ pub fn charge_usage_one(
             sub.lifetime_charged = pending_lifetime;
             let cap_reached = sub
                 .lifetime_cap
-                .map(|cap| sub.lifetime_charged >= cap)
+                .map(|cap| crate::subscription::lifetime_cap_reached(cap, sub.lifetime_charged))
                 .unwrap_or(false);
 
             if cap_reached {
@@ -1255,6 +1356,7 @@ pub fn charge_usage_one(
                 subscription_id,
                 usage_amount,
                 sub.merchant.clone(),
+                sub.token.clone(),
                 BillingChargeKind::Usage,
                 now,
                 now,
@@ -1389,4 +1491,84 @@ pub(crate) fn credit_charge_payees(
         )?;
     }
     Ok(())
+}
+
+/// Calculates the prorated charge amount for a partial first billing period.
+///
+/// # Arguments
+/// * `amount` - The full charge amount for one complete interval (must be non-negative)
+/// * `interval` - The complete billing interval in seconds (must be > 0)
+/// * `remaining_seconds` - Seconds remaining in the current partial interval (0..=u64::MAX)
+///
+/// # Returns
+/// * `Ok(prorated_amount)` - The charge amount scaled proportionally to elapsed time
+/// * `Err(Error::InvalidAmount)` - If amount is negative
+/// * `Err(Error::InvalidInput)` - If interval is 0
+///
+/// # Formula
+/// `prorated_amount = (amount * remaining_seconds) / interval`
+///
+/// # Invariants
+/// - `0 <= prorated_amount <= amount`
+/// - Monotonic: if `rem_low <= rem_high`, then `charge(rem_low) <= charge(rem_high)`
+/// - If `remaining_seconds >= interval`, returns `amount` (capped at full amount)
+/// - If `remaining_seconds == 0`, returns `0`
+pub fn calculate_prorated_first_charge(
+    amount: i128,
+    interval: u64,
+    remaining_seconds: u64,
+) -> Result<i128, Error> {
+    // Validate inputs
+    if amount < 0 {
+        return Err(Error::InvalidAmount);
+    }
+    
+    if interval == 0 {
+        return Err(Error::InvalidInput);
+    }
+    
+    // Handle edge case: if remaining_seconds is 0, no charge
+    if remaining_seconds == 0 {
+        return Ok(0);
+    }
+    
+    // Cap remaining_seconds to interval to avoid overflow
+    // If remaining >= interval, we charge the full amount
+    if remaining_seconds >= interval {
+        return Ok(amount);
+    }
+    
+    // Compute (amount * remaining_seconds) / interval safely
+    // Strategy: Check if we can do the multiplication in i128 first
+    // If not, use u128 for intermediate calculation
+    
+    // First try direct i128 multiplication to be efficient for small values
+    match amount.checked_mul(remaining_seconds as i128) {
+        Some(product) => {
+            // Multiplication succeeded, safe to divide
+            let prorated = product / interval as i128;
+            Ok(prorated.min(amount))
+        }
+        None => {
+            // Multiplication would overflow i128
+            // Use u128 for intermediate calculation
+            // amount is i128, convert to u128 (it's non-negative)
+            let amount_u128 = amount as u128;
+            let remaining_u128 = remaining_seconds as u128;
+            let interval_u128 = interval as u128;
+            
+            let product_u128 = amount_u128
+                .checked_mul(remaining_u128)
+                .ok_or(Error::InvalidAmount)?;
+            
+            let prorated_u128 = product_u128 / interval_u128;
+            
+            // Convert back to i128 (should not overflow since result <= amount < i128::MAX)
+            if prorated_u128 > i128::MAX as u128 {
+                Err(Error::InvalidAmount)
+            } else {
+                Ok((prorated_u128 as i128).min(amount))
+            }
+        }
+    }
 }

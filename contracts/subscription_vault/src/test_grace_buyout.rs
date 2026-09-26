@@ -308,7 +308,7 @@ fn test_grace_buyout_with_existing_balance() {
 
     // Give some balance before entering grace period.
     token_admin.mint(&subscriber, &AMOUNT);
-    client.deposit_funds(&id, &subscriber, &AMOUNT, &None::<soroban_sdk::BytesN<32>>);
+    client.deposit_funds(&id, &AMOUNT, &None::<soroban_sdk::BytesN<32>>);
 
     force_into_grace_period(&env, &client, id);
 

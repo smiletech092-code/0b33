@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "description": "CPU-instruction baselines for batch_charge at 100 and 500 subscriptions. Fail if measured cost exceeds baseline by more than tolerance_pct.",
+  "tolerance_pct": 15.0,
+  "scenarios": {
+    "batch_100_all_chargeable": {
+      "cpu": 0,
+      "note": "Populate with the measured value from the first passing run, then tighten tolerance_pct to 10.0."
+    },
+    "batch_500_all_chargeable": {
+      "cpu": 0,
+      "note": "Populate with the measured value from the first passing run."
+    },
+    "batch_100_half_insufficient": {
+      "cpu": 0,
+      "note": "50 subscriptions have zero balance; 50 are chargeable."
+    },
+    "batch_500_half_insufficient": {
+      "cpu": 0,
+      "note": "250 subscriptions have zero balance; 250 are chargeable."
+    }
+  }
+}

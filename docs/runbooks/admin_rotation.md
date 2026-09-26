@@ -282,6 +282,59 @@ stellar contract invoke \
 
 **Timeline:** Immediate. No state change other than proposal removal.
 
+**This is the rollback for "the new admin key is compromised before
+acceptance", and it is always available while the proposal is unclaimed.**
+
+The full entrypoint, its error codes and the reasoning are in
+[`admin_rotation.md`](../admin_rotation.md) → *Two-Step Rotation and
+Rollback*. Operationally:
+
+```bash
+# 1. Confirm the proposal is still pending and who it names.
+stellar contract invoke --id CONTRACT_ID --rpc-url "$RPC" \
+  --network-passphrase "$PASSPHRASE" --source "$ADMIN_A_SECRET" -- \
+  get_admin_proposal
+# If this returns None there is nothing to cancel — see 4.1.1.
+
+# 2. Cancel. Actor MUST be the current stored admin (Admin A).
+stellar contract invoke --id CONTRACT_ID --rpc-url "$RPC" \
+  --network-passphrase "$PASSPHRASE" --source "$ADMIN_A_SECRET" -- \
+  cancel_admin_proposal \
+  --admin $(stellar address from-secret "$ADMIN_A_SECRET")
+# Emits: admin_proposal_cancelled
+```
+
+**Properties that make this safe mid-incident:**
+
+| Property | Consequence |
+|----------|-------------|
+| No 24 h cooldown on cancel | Cancelling is immediate, not deferred. |
+| `claim_admin_role` needs a 24 h cooldown after the proposal | Cancelling inside that window means the new admin **provably** cannot have claimed. Race-free. |
+| Only the stored admin may cancel | `Unauthorized` otherwise — you cannot cancel someone else's proposal, and cancelling never changes who the stored admin is. |
+| Removes one instance-storage key | `DataKey::Admin`, subscriptions, balances, nonces and all other config are untouched. |
+| No nonce consumed | A stale `get_admin_nonce` cannot block or be burned by a cancel. |
+| Repeatable | `propose_admin` succeeds again immediately after cancelling. |
+
+**Deadline:** the 24 h claim cooldown (`ADMIN_PROPOSAL_COOLDOWN_SECS`), *not*
+the 7-day proposal expiry. Once the cooldown has elapsed **and** the new admin
+has claimed, there is no rollback — see 4.2.
+
+##### 4.1.1 `get_admin_proposal` returns `None`
+
+The proposal has already been claimed, cancelled, or expired. Determine which
+before doing anything else:
+
+- An `admin_proposal_claimed` event in the contract's event history → the new
+  admin already holds the role. Go to **4.2**.
+- An `admin_proposal_cancelled` event → already rolled back. Nothing to do.
+- Neither, and `get_admin_proposal()` is `None` → a `claim_admin_role` that hit
+  `ProposalExpired` **removes** the stale proposal as a side effect. Treat as
+  expired; re-propose from scratch.
+
+**Do not** respond to a `None` proposal by assuming no rotation happened.
+`get_admin()` is the authority on who the stored admin is; `get_admin_proposal`
+only reports what is *pending*.
+
 ### 4.2 Proposal Was Already Claimed
 
 **Path:** Admin B (now the stored admin) must voluntarily create a new proposal back to Admin A or another trusted address.

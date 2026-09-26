@@ -36,7 +36,7 @@ the host layer when no signature is present.
 | `export_contract_snapshot` | Explicit `admin` arg must equal stored admin | `Unauthorized` | `Unauthorized` | Export-only surface |
 | `export_subscription_summary` | Explicit `admin` arg must equal stored admin | `Unauthorized` | `Unauthorized` | Single-subscription export |
 | `export_subscription_summaries` | Explicit `admin` arg must equal stored admin | `Unauthorized` | `Unauthorized` | Paged export |
-| `set_subscriber_credit_limit` | Explicit `admin` arg must equal stored admin | `Unauthorized` | `Unauthorized` | Subscriber risk control |
+| `set_subscriber_credit_limit` | Explicit `admin` arg must equal stored admin | `Unauthorized` | `Unauthorized` | Subscriber risk control. Subscriber cannot self-increase; no delegation path exists. Lowering below current exposure is permitted and takes effect immediately without claw-back. |
 | `partial_refund` | Explicit `admin` arg must equal stored admin | `Unauthorized` | `Unauthorized` | Subscriber parameter mismatch is also `Unauthorized` |
 | `set_billing_retention` | Explicit `admin` arg must equal stored admin | `Unauthorized` | `Unauthorized` | Statement retention policy |
 | `compact_billing_statements` | Explicit `admin` arg must equal stored admin | `Unauthorized` | `Unauthorized` | Maintenance operation |
@@ -141,6 +141,58 @@ requiring an extra migration step.
 |-----|------|-------|
 | `DataKey::Operator` (discriminant 38) | instance | `Address` — the stored operator, absent when unset |
 | `DataKey::AdminNonce(operator, 2)` | persistent | `u64` — next expected operator batch-charge nonce |
+
+## Coupon operations
+
+Coupons are merchant-owned objects. Creation and revocation are gated on the merchant's
+own signature; binding a coupon to a subscription is gated on the subscriber's own signature.
+Neither the admin nor the operator has a special code path for coupon management.
+
+All mutating coupon entrypoints are also blocked during an active emergency stop
+(`require_not_emergency_stop`); `get_coupon` is read-only and always available.
+
+### Merchant-owned coupon entrypoints
+
+| Entrypoint | Authorization model | Wrong-merchant result | Notes |
+|---|---|---|---|
+| `create_coupon` | `merchant` arg signs the transaction (`merchant.require_auth()`); stored as `coupon.merchant` | Host auth failure if unsigned; no further check needed at creation | Code must be globally unique (`CouponAlreadyExists` if duplicate). Emergency-stop gated. |
+| `revoke_coupon` | `merchant` arg signs (`merchant.require_auth()`); then `coupon.merchant != merchant → Unauthorized` | `Unauthorized` | Any address can call with a valid signature, but only the creating merchant passes the ownership check. Already-bound coupons are skipped silently at charge time after revocation. Emergency-stop gated. |
+
+### Subscriber-owned coupon entrypoints
+
+| Entrypoint | Authorization model | Wrong-subscriber result | Notes |
+|---|---|---|---|
+| `apply_coupon` | `subscriber` arg signs the transaction (`subscriber.require_auth()`); then `sub.subscriber != subscriber → Unauthorized` | `Unauthorized` | Subscriber must own the target subscription. One coupon per subscription (`CouponAlreadyApplied`). Same `(subscription_id, code)` pair cannot be reapplied (`Replay`). Coupon token must match subscription token (`CouponTokenMismatch`). Emergency-stop gated. |
+
+### Read-only coupon entrypoints (no auth)
+
+| Entrypoint | Returns | Notes |
+|---|---|---|
+| `get_coupon` | `Option<Coupon>` | Public; no signature required. Returns `None` for unknown codes. |
+
+### Coupon authorization summary
+
+| Operation | Required signer | Admin can perform? | Operator can perform? |
+|---|---|---|---|
+| Create coupon | Merchant (coupon owner) | ✗ | ✗ |
+| Revoke coupon | Merchant (coupon owner) | ✗ | ✗ |
+| Apply coupon to subscription | Subscriber (subscription owner) | ✗ | ✗ |
+| Read coupon | — (public) | ✓ (no auth needed) | ✓ (no auth needed) |
+
+### Cross-verification notes
+
+- `create_coupon`: `merchant.require_auth()` is the only check. Any address that can sign may
+  create a coupon attributed to itself. The coupon's `merchant` field is set to the signing
+  address and is immutable after creation.
+- `revoke_coupon`: requires both a valid signature **and** ownership (`coupon.merchant == merchant`).
+  This two-step guard prevents an attacker who somehow supplies a valid signature for a different
+  address from revoking another merchant's coupon.
+- `apply_coupon`: requires both a valid subscriber signature **and** subscription ownership
+  (`sub.subscriber == subscriber`). The redemption limit (`max_redemptions`) is enforced at
+  apply time, not at charge time — a subscriber who bound the coupon before the limit was
+  reached keeps the discount even if the global limit fills up later.
+- Discount is applied silently at charge time (no auth required). If a coupon is revoked or
+  expired after binding, the charge proceeds at full gross amount without failing.
 
 ## Rotation and replay notes
 

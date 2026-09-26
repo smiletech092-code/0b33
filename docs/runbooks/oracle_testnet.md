@@ -2,8 +2,12 @@
 
 > **Issue #853** — Operator runbook for deploying `oracle_adapter` to testnet  
 > **Audience:** On-call engineers responding to testnet incidents  
-> **Last updated:** 2026-07-30  
+> **Last updated:** 2026-09-25  
 > **Stellar testnet passphrase:** `Test SDF Network ; September 2015`
+
+> **CLI version requirement:** This runbook requires **Stellar CLI v25.0.0 or later** (`stellar --version`).  
+> v25.0.0 deprecated `--fee` in favour of `--inclusion-fee` and `--resource-fee`; earlier versions will produce a flag-not-found error on any `stellar contract invoke` command that sets fees.  
+> Install or upgrade: `cargo install --locked stellar-cli --features opt` or see the [Stellar CLI releases](https://github.com/stellar/stellar-cli/releases).
 
 ---
 
@@ -61,10 +65,15 @@ This runbook covers the complete deployment and operational validation of the `o
 
 ### Required Tools
 
-- **Stellar CLI** (`stellar`) — latest stable release
+- **Stellar CLI** (`stellar`) — v25.0.0 or later (see version note above)
 - **Soroban RPC endpoint** — testnet access
 - **Admin private key** — stored in secure key management (1Password / HashiCorp Vault)
 - **Oracle contract Wasm** — pre-compiled and tested
+
+> **Fee flags:** Since v25.0.0 the `--fee` flag is deprecated. Use `--inclusion-fee <stroops>` to cap the base inclusion fee and `--resource-fee <stroops>` to cap the resource fee for a Soroban transaction. Most commands in this runbook do not require fee overrides (the CLI auto-bumps fees), but if you need to force a higher fee use:
+> ```bash
+> stellar contract invoke ... --inclusion-fee 10000 -- <fn>
+> ```
 
 ### Environment Variables
 
@@ -974,6 +983,7 @@ test result: ok. 15 passed; 0 failed; 0 ignored
 
 | Date | Author | Change |
 |------|--------|--------|
+| 2026-09-25 | Protocol Team | Added CLI v25.0.0+ version requirement; documented `--fee` → `--inclusion-fee`/`--resource-fee` migration; updated last-updated date (Issue #236) |
 | 2026-07-30 | Protocol Team | Initial runbook for Issue #853 |
 
 ---

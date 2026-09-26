@@ -151,8 +151,7 @@ fn fund_merchant_balance(f: &Fixture, token: &Address, amount: i128) {
         &None::<u64>,
         &None::<u32>,
     );
-    f.client
-        .deposit_funds(&id, &subscriber, &amount, &None::<soroban_sdk::BytesN<32>>);
+    f.client.deposit_funds(&id, &amount, &None::<soroban_sdk::BytesN<32>>);
 
     let now = f.env.ledger().timestamp();
     f.env.ledger().set_timestamp(now + INTERVAL + 1);
@@ -254,12 +253,8 @@ fn withdraw_token_a_with_pending_token_b_dispute_isolates_balances() {
         &None::<u64>,
         &None::<u32>,
     );
-    f.client.deposit_funds(
-        &sub_b_id,
-        &subscriber_b,
-        &AMOUNT_B,
-        &None::<soroban_sdk::BytesN<32>>,
-    );
+    f.client.deposit_funds(&sub_b_id, &AMOUNT_B,
+        &None::<soroban_sdk::BytesN<32>>,);
     let now = f.env.ledger().timestamp();
     f.env.ledger().set_timestamp(now + INTERVAL + 1);
     f.client

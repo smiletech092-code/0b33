@@ -25,15 +25,63 @@
 use soroban_sdk::{Address, Env};
 use crate::types::{DataKey, Error, NonceConsumedEvent};
 
+/// Type-enforced nonce domain. Replaces bare `u32` domain constants so a call
+/// site cannot silently pass the wrong domain (or a value from an unrelated
+/// constant set) without a compile error — the wrong domain constant would
+/// still be a valid `u32`, but it cannot be a valid `NonceDomain` variant
+/// belonging to a different operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum NonceDomain {
+    BatchCharge = 0,
+    AdminRotation = 1,
+    OperatorBatchCharge = 2,
+    MetadataSigned = 3,
+    MerchantRotation = 4,
+    ChargeInterval = 5,
+    DepositFunds = 6,
+    ChargeOneoff = 7,
+    SubscriberWithdrawal = 8,
+    ChargebackDispute = 9,
+    GovernanceVote = 10,
+}
+
+impl NonceDomain {
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+impl TryFrom<u32> for NonceDomain {
+    type Error = ();
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(NonceDomain::BatchCharge),
+            1 => Ok(NonceDomain::AdminRotation),
+            2 => Ok(NonceDomain::OperatorBatchCharge),
+            3 => Ok(NonceDomain::MetadataSigned),
+            4 => Ok(NonceDomain::MerchantRotation),
+            5 => Ok(NonceDomain::ChargeInterval),
+            6 => Ok(NonceDomain::DepositFunds),
+            7 => Ok(NonceDomain::ChargeOneoff),
+            8 => Ok(NonceDomain::SubscriberWithdrawal),
+            9 => Ok(NonceDomain::ChargebackDispute),
+            10 => Ok(NonceDomain::GovernanceVote),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Domain constant for batch charge operations.
 /// Prevents replay of batch_charge nonces into rotate_admin and vice versa.
-pub const DOMAIN_BATCH_CHARGE: u32 = 0;
+pub const DOMAIN_BATCH_CHARGE: NonceDomain = NonceDomain::BatchCharge;
 
 /// Domain constant for admin rotation operations.
-pub const DOMAIN_ADMIN_ROTATION: u32 = 1;
+pub const DOMAIN_ADMIN_ROTATION: NonceDomain = NonceDomain::AdminRotation;
 
 /// Domain constant for operator batch charge operations.
-pub const DOMAIN_OPERATOR_BATCH_CHARGE: u32 = 2;
+pub const DOMAIN_OPERATOR_BATCH_CHARGE: NonceDomain = NonceDomain::OperatorBatchCharge;
 
 /// Domain constant for off-chain signed metadata updates (`set_metadata_signed`).
 ///
@@ -41,26 +89,33 @@ pub const DOMAIN_OPERATOR_BATCH_CHARGE: u32 = 2;
 /// rotation, and operator nonces, so a captured signed metadata payload cannot
 /// be replayed into a higher-privilege domain. Auth check (signer must be
 /// subscriber or merchant) runs **before** the nonce check.
-pub const DOMAIN_METADATA_SIGNED: u32 = 3;
+pub const DOMAIN_METADATA_SIGNED: NonceDomain = NonceDomain::MetadataSigned;
 
 /// Domain constant for merchant address rotation operations.
 ///
 /// Keeps `rotate_merchant_address` nonces separated from every other domain so
 /// a captured rotation payload cannot be replayed against a different
 /// privileged operation for the same admin signer.
-pub const DOMAIN_MERCHANT_ROTATION: u32 = 4;
+pub const DOMAIN_MERCHANT_ROTATION: NonceDomain = NonceDomain::MerchantRotation;
 
-pub const DOMAIN_SUBSCRIBER_WITHDRAWAL: u32 = 8;
-pub const DOMAIN_CHARGEBACK_DISPUTE: u32 = 9;
+pub const DOMAIN_SUBSCRIBER_WITHDRAWAL: NonceDomain = NonceDomain::SubscriberWithdrawal;
+pub const DOMAIN_CHARGEBACK_DISPUTE: NonceDomain = NonceDomain::ChargebackDispute;
+
+/// Domain constant for governance vote casting operations.
+///
+/// Prevents a captured signed vote payload from being replayed into a
+/// different operation domain. Auth check (caller must be a guardian)
+/// runs **before** the nonce check.
+pub const DOMAIN_GOVERNANCE_VOTE: NonceDomain = NonceDomain::GovernanceVote;
 
 /// Domain constant for charge_interval operations.
-pub const DOMAIN_CHARGE_INTERVAL: u32 = 5;
+pub const DOMAIN_CHARGE_INTERVAL: NonceDomain = NonceDomain::ChargeInterval;
 
 /// Domain constant for deposit_funds operations.
-pub const DOMAIN_DEPOSIT_FUNDS: u32 = 6;
+pub const DOMAIN_DEPOSIT_FUNDS: NonceDomain = NonceDomain::DepositFunds;
 
 /// Domain constant for charge_one_off operations.
-pub const DOMAIN_CHARGE_ONEOFF: u32 = 7;
+pub const DOMAIN_CHARGE_ONEOFF: NonceDomain = NonceDomain::ChargeOneoff;
 
 /// Retrieve the current (next-expected) nonce for a `(signer, domain)` pair.
 ///
@@ -75,10 +130,10 @@ pub const DOMAIN_CHARGE_ONEOFF: u32 = 7;
 /// # Returns
 ///
 /// The next expected nonce value (starting at 0).
-pub fn get_nonce(env: &Env, signer: &Address, domain: u32) -> u64 {
+pub fn get_nonce(env: &Env, signer: &Address, domain: NonceDomain) -> u64 {
     env.storage()
         .persistent()
-        .get::<DataKey, u64>(&DataKey::AdminNonce(signer.clone(), domain))
+        .get::<DataKey, u64>(&DataKey::AdminNonce(signer.clone(), domain.as_u32()))
         .unwrap_or(0)
 }
 
@@ -125,9 +180,10 @@ pub fn compute_next_nonce(stored: u64, expected: u64) -> Result<u64, Error> {
 pub fn check_and_advance(
     env: &Env,
     signer: &Address,
-    domain: u32,
+    domain: NonceDomain,
     expected: u64,
 ) -> Result<(), Error> {
+    let domain = domain.as_u32();
     let key = DataKey::AdminNonce(signer.clone(), domain);
     let stored = env.storage().persistent().get::<DataKey, u64>(&key).unwrap_or(0);
 
@@ -159,16 +215,17 @@ mod tests {
     /// Mock test to verify constant values are correct.
     #[test]
     fn test_domain_constants() {
-        assert_eq!(DOMAIN_BATCH_CHARGE, 0);
-        assert_eq!(DOMAIN_ADMIN_ROTATION, 1);
-        assert_eq!(DOMAIN_OPERATOR_BATCH_CHARGE, 2);
-        assert_eq!(DOMAIN_METADATA_SIGNED, 3);
-        assert_eq!(DOMAIN_MERCHANT_ROTATION, 4);
-        assert_eq!(DOMAIN_CHARGE_INTERVAL, 5);
-        assert_eq!(DOMAIN_DEPOSIT_FUNDS, 6);
-        assert_eq!(DOMAIN_CHARGE_ONEOFF, 7);
-        assert_eq!(DOMAIN_SUBSCRIBER_WITHDRAWAL, 8);
-        assert_eq!(DOMAIN_CHARGEBACK_DISPUTE, 9);
+        assert_eq!(DOMAIN_BATCH_CHARGE.as_u32(), 0);
+        assert_eq!(DOMAIN_ADMIN_ROTATION.as_u32(), 1);
+        assert_eq!(DOMAIN_OPERATOR_BATCH_CHARGE.as_u32(), 2);
+        assert_eq!(DOMAIN_METADATA_SIGNED.as_u32(), 3);
+        assert_eq!(DOMAIN_MERCHANT_ROTATION.as_u32(), 4);
+        assert_eq!(DOMAIN_CHARGE_INTERVAL.as_u32(), 5);
+        assert_eq!(DOMAIN_DEPOSIT_FUNDS.as_u32(), 6);
+        assert_eq!(DOMAIN_CHARGE_ONEOFF.as_u32(), 7);
+        assert_eq!(DOMAIN_SUBSCRIBER_WITHDRAWAL.as_u32(), 8);
+        assert_eq!(DOMAIN_CHARGEBACK_DISPUTE.as_u32(), 9);
+        assert_eq!(DOMAIN_GOVERNANCE_VOTE.as_u32(), 10);
     }
 
     /// All nine domain constants must be pairwise distinct — a collision here
@@ -186,6 +243,7 @@ mod tests {
             DOMAIN_CHARGE_ONEOFF,
             DOMAIN_SUBSCRIBER_WITHDRAWAL,
             DOMAIN_CHARGEBACK_DISPUTE,
+            DOMAIN_GOVERNANCE_VOTE,
         ];
         for i in 0..domains.len() {
             for j in (i + 1)..domains.len() {
@@ -202,7 +260,7 @@ mod tests {
         let contract_id = env.register(crate::SubscriptionVault, ());
 
         let res = env.as_contract(&contract_id, || {
-            let key = DataKey::AdminNonce(signer.clone(), domain);
+            let key = DataKey::AdminNonce(signer.clone(), domain.as_u32());
             // Seed with u64::MAX
             env.storage().persistent().set(&key, &u64::MAX);
 

@@ -68,12 +68,8 @@ fn test_deposit_insufficient_token_balance_reverts() {
     let sub_before = client.get_subscription(&id);
 
     // Subscriber has 0 tokens — the token.transfer inside deposit_funds must revert
-    let result = client.try_deposit_funds(
-        &id,
-        &subscriber,
-        &5_000_000i128,
-        &None::<soroban_sdk::BytesN<32>>,
-    );
+    let result = client.try_deposit_funds(&id, &5_000_000i128,
+        &None::<soroban_sdk::BytesN<32>>,);
     assert!(
         result.is_err(),
         "deposit with zero subscriber balance must fail"
@@ -108,12 +104,8 @@ fn test_deposit_insufficient_partial_balance_reverts() {
     let sub_before = client.get_subscription(&id);
 
     // Try to deposit more than the subscriber holds
-    let result = client.try_deposit_funds(
-        &id,
-        &subscriber,
-        &5_000_000i128,
-        &None::<soroban_sdk::BytesN<32>>,
-    );
+    let result = client.try_deposit_funds(&id, &5_000_000i128,
+        &None::<soroban_sdk::BytesN<32>>,);
     assert!(
         result.is_err(),
         "deposit exceeding subscriber balance must fail"
@@ -152,12 +144,8 @@ fn test_deposit_rejected_when_credit_limit_exceeded() {
 
     // Deposit min_topup (1_000_000) should be rejected since
     // exposure (10_000_000) + 1_000_000 > limit (1_000_000)
-    let result = client.try_deposit_funds(
-        &id,
-        &subscriber,
-        &1_000_000i128,
-        &None::<soroban_sdk::BytesN<32>>,
-    );
+    let result = client.try_deposit_funds(&id, &1_000_000i128,
+        &None::<soroban_sdk::BytesN<32>>,);
     assert_eq!(
         result,
         Err(Ok(Error::CreditLimitExceeded)),
@@ -190,7 +178,7 @@ fn test_deposit_allowed_within_credit_limit() {
     let vault_before = token_client.balance(&client.address);
 
     let result =
-        client.try_deposit_funds(&id, &subscriber, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
+        client.try_deposit_funds(&id, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
     assert!(result.is_ok(), "deposit within credit limit should succeed");
 
     // Verify deposit was applied
@@ -230,12 +218,8 @@ fn test_deposit_credit_limit_aggregate_two_subs() {
     let sub1_before = client.get_subscription(&id1);
     let sub2_before = client.get_subscription(&id2);
 
-    let result = client.try_deposit_funds(
-        &id1,
-        &subscriber,
-        &1_000_000i128,
-        &None::<soroban_sdk::BytesN<32>>,
-    );
+    let result = client.try_deposit_funds(&id1, &1_000_000i128,
+        &None::<soroban_sdk::BytesN<32>>,);
     assert_eq!(
         result,
         Err(Ok(Error::CreditLimitExceeded)),

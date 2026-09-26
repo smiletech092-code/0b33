@@ -120,19 +120,68 @@ specification:
 
 ## 4. Tolerance & Regression Policy
 
-### 4.1 Pass / Fail criteria
+### 4.1 Automated regression detection (CI)
 
-CI (`cargo test --all`) validates **correctness**, not raw performance. There
-is **no automated gas-limit or instruction-count threshold** in CI today.
-Performance regression detection is a **manual review step**.
+The `.github/workflows/bench-regression.yml` workflow enforces a **20% CPU
+regression threshold** on every pull request targeting `main`.
 
-The following heuristics apply during code review:
+#### How it works
+
+1. **`run-benchmarks` job** — runs all bench harnesses with `--nocapture`,
+   pipes output through `scripts/bench_extract.py` to produce
+   `bench_results.json`, then uploads it as a GitHub Actions artifact.
+
+   - Per-commit artifact name: `bench-results-<sha>` (retained 90 days).
+   - Main-branch stable name: `bench-results-main` (overwritten on every push
+     to main, retained 90 days).
+
+2. **`compare-benchmarks` job** (PRs only) — downloads `bench-results-main`
+   from the most-recent successful main run, then runs
+   `scripts/bench_compare.py` which:
+
+   - Computes `delta_pct = (current_cpu − baseline_cpu) / baseline_cpu × 100`.
+   - **Fails the job** if any benchmark exceeds the threshold.
+   - Prints a table of improvements, unchanged metrics, and regressions to the
+     job log and the GitHub step summary.
+
+#### Threshold
+
+| Threshold | Value | File |
+|---|---|---|
+| Regression failure | **20%** | `REGRESSION_THRESHOLD` env var in `bench-regression.yml` |
+| Fixture-level tolerance (per-bench) | 10–15% | `fixtures/*_budget.json` |
+
+The two thresholds serve different purposes:
+- **Fixture tolerance** (in-code) catches regressions *within* a single bench
+  run, even before a baseline artifact exists.
+- **CI artifact comparison** (20%) catches regressions *across runs*, including
+  regressions that individually pass each fixture but accumulate across a
+  series of PRs.
+
+#### Responding to a regression failure
+
+If the comparison job fails:
+
+1. Check the step summary for the regression table.
+2. If the regression is **unintentional** — profile the change and fix it
+   before merging.
+3. If the regression is **intentional** (e.g. a new feature unavoidably adds
+   storage writes):
+   - Document the rationale in the PR description.
+   - Update the relevant `fixtures/*_budget.json` baseline.
+   - The new `bench-results-main` artifact will be written automatically when
+     the PR merges.
+
+#### Pass / Fail criteria (manual review supplement)
+
+The following heuristics still apply during code review in addition to the
+automated check:
 
 | Signal | Threshold | Action |
 |---|---|---|
 | New storage writes per call | > 0 (unless a new feature explicitly requires it) | Reviewer flags; author must justify |
 | New storage reads per call | > 0 (unless justified by new query functionality) | Reviewer flags; author must justify |
-| Estimated CPU instructions | ≥ 15% increase vs. baseline | Author must run `soroban contract invoke --cost` and report diff |
+| Estimated CPU instructions | ≥ 20% increase vs. baseline | Automated CI fails; author must fix or document |
 | Scan depth increase | Any change to `MAX_SCAN_DEPTH` or `MAX_WRITE_PATH_SCAN_DEPTH` | Requires team lead approval |
 | Budget reset in test | Any new `env.budget().reset_unlimited()` call | Must be accompanied by a comment explaining why unlimited budget is needed |
 
@@ -244,6 +293,14 @@ cargo test --all
 
 | File | Description |
 |---|---|
+| `contracts/subscription_vault/benches/batch_charge_100_500.rs` | `batch_charge` CPU regression at 100 and 500 subscriptions; per-item scaling assertion |
+| `contracts/subscription_vault/benches/batch_charge_scaling.rs` | `batch_charge` cost CSV across sizes 1/10/50/100 for four scenarios |
+| `contracts/subscription_vault/benches/charge_cold_warm.rs` | `charge_subscription` cold vs warm storage path cost |
+| `contracts/subscription_vault/benches/withdraw_fixed_cost.rs` | `withdraw_merchant_funds` fixed-cost baseline |
+| `contracts/subscription_vault/benches/dispute_lifecycle.rs` | Dispute open/respond/resolve per-phase cost |
+| `contracts/subscription_vault/benches/gov_tally.rs` | Governance quorum tally voter-count scaling |
+| `contracts/subscription_vault/benches/idem_lookup.rs` | Idempotency ring-buffer constant-time lookup |
+| `contracts/subscription_vault/benches/ttl_extension.rs` | TTL extension cost (trigger vs skip) |
 | `contracts/subscription_vault/src/test_query_performance.rs` | Tests query scan-depth limits, pagination, and budget reset |
 | `contracts/subscription_vault/src/test_deterministic_charging.rs` | Verifies charge determinism across intervals |
 | `contracts/subscription_vault/src/test_multi_actor.rs` | Multi-subscriber, multi-merchant concurrent scenarios |
@@ -256,6 +313,34 @@ cargo test --all
 | `contracts/subscription_vault/src/test_recovery.rs` | Fund recovery and emergency-stop paths |
 | `contracts/subscription_vault/src/test_emergency_stop_lifetime_caps.rs` | Emergency stop + lifetime cap interaction |
 | `docs/query_performance.md` | Query performance guardrail documentation |
+
+### 7.1 `batch_charge` baseline fixtures
+
+Baselines for `batch_charge_100_500.rs` live in
+`contracts/subscription_vault/benches/fixtures/batch_charge_scaling_budget.json`.
+
+The `"cpu"` field for each scenario starts at `0` (no enforcement) so the
+first run can measure a real value without failing.  Once measured, record the
+value and lower `tolerance_pct` to `10.0`:
+
+```json
+{
+  "tolerance_pct": 10.0,
+  "scenarios": {
+    "batch_100_all_chargeable": { "cpu": <measured> },
+    "batch_500_all_chargeable": { "cpu": <measured> },
+    "batch_100_half_insufficient": { "cpu": <measured> },
+    "batch_500_half_insufficient": { "cpu": <measured> }
+  }
+}
+```
+
+To capture the initial values run:
+
+```bash
+cargo test -p subscription_vault bench_batch_charge -- --nocapture 2>&1 \
+  | grep '\[bench_batch_charge\]'
+```
 
 ---
 

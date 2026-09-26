@@ -428,6 +428,82 @@ def test_main_new_variant_without_remediation_flags_warning(tmp_path, capsys):
     assert "Undocumented variants" in updated
 
 
+# ---------------------------------------------------------------------------
+# Tests: undocumented-variant gate (issue #218)
+#
+# A variant in types.rs with no REMEDIATION entry must make the generator
+# exit non-zero, otherwise a new error can be merged undocumented and CI
+# stays green.
+# ---------------------------------------------------------------------------
+
+
+def test_main_exits_1_for_undocumented_variant(tmp_path):
+    """Non-check mode still fails when a variant lacks a REMEDIATION entry."""
+    repo = _make_repo(tmp_path, MINIMAL_TYPES_RS_WITH_NEW, _ERRORS_MD_WITHOUT_SENTINELS, {})
+    rc = main(["--repo-root", str(repo)])
+    assert rc == 1
+
+
+def test_main_check_exits_1_for_undocumented_variant(tmp_path):
+    """--check fails on an undocumented variant even when the file is fresh."""
+    repo = _make_repo(tmp_path, MINIMAL_TYPES_RS_WITH_NEW, _ERRORS_MD_WITHOUT_SENTINELS, {})
+    # Generate the table first so the file is NOT stale; only the
+    # undocumented variant should be the cause of failure.
+    main(["--repo-root", str(repo)])
+    rc = main(["--check", "--repo-root", str(repo)])
+    assert rc == 1
+
+
+def test_main_exits_0_when_all_variants_documented(tmp_path):
+    """Every variant documented => no undocumented failure."""
+    repo = _make_repo(tmp_path, MINIMAL_TYPES_RS, _ERRORS_MD_WITHOUT_SENTINELS, {})
+    assert main(["--repo-root", str(repo)]) == 0
+    assert main(["--check", "--repo-root", str(repo)]) == 0
+
+
+def test_main_undocumented_reports_variant_name(tmp_path, capsys):
+    """The failure message names the offending variant and its code."""
+    repo = _make_repo(tmp_path, MINIMAL_TYPES_RS_WITH_NEW, _ERRORS_MD_WITHOUT_SENTINELS, {})
+    main(["--repo-root", str(repo)])
+    captured = capsys.readouterr()
+    assert "BrandNewVariant" in captured.err
+    assert "9999" in captured.err
+
+
+def test_real_repo_has_no_undocumented_variants():
+    """Every variant in the real types.rs must have remediation prose."""
+    if not MOD.TYPES_RS.exists():
+        pytest.skip("types.rs not found — not in repository")
+    variants = parse_variants(MOD.TYPES_RS)
+    undocumented = [v.name for v in variants if v.name not in REMEDIATION]
+    assert undocumented == [], (
+        "Error variants present in types.rs but missing from the REMEDIATION "
+        f"map in scripts/generate_error_table.py: {undocumented}"
+    )
+
+
+def test_remediation_has_no_stale_entries():
+    """REMEDIATION must not carry entries for variants that no longer exist."""
+    if not MOD.TYPES_RS.exists():
+        pytest.skip("types.rs not found — not in repository")
+    names = {v.name for v in parse_variants(MOD.TYPES_RS)}
+    stale = [k for k in REMEDIATION if k not in names]
+    assert stale == [], (
+        f"REMEDIATION entries with no matching variant in types.rs: {stale}"
+    )
+
+
+def test_category_covers_every_real_variant():
+    """No real variant should fall into the 'Unknown' category bucket."""
+    if not MOD.TYPES_RS.exists():
+        pytest.skip("types.rs not found — not in repository")
+    unknown = [f"{v.name}={v.code}" for v in parse_variants(MOD.TYPES_RS)
+               if _category(v.code) == "Unknown"]
+    assert unknown == [], (
+        f"Variants whose code falls outside every _CATEGORY_RANGES bucket: {unknown}"
+    )
+
+
 def test_main_check_fails_when_new_variant_added(tmp_path):
     """CI must fail when a new variant lands without updating docs."""
     repo = _make_repo(tmp_path, MINIMAL_TYPES_RS, _ERRORS_MD_WITHOUT_SENTINELS, {})

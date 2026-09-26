@@ -174,17 +174,17 @@ mod tests {
         );
     }
 
-    /// An override equal to MAX_FEE_BIPS (10_000) when global = 10_000 is accepted;
-    /// values above MAX_FEE_BIPS are always rejected regardless of global.
+    /// Setting the protocol fee above MAX_PROTOCOL_FEE_BIPS (500) is rejected;
+    /// merchant override above MAX_FEE_BIPS is also rejected.
     #[test]
     fn test_override_above_max_fee_bips_rejected() {
         let t = TestEnv::default();
         let treasury = Address::generate(&t.env);
-        // Set global fee to max so the only way to trip the MAX check is to go over it.
-        t.client.set_protocol_fee(&t.admin, &treasury, &10_000);
+        // Set global fee to the protocol cap (500 bps).
+        t.client.set_protocol_fee(&t.admin, &treasury, &500);
         let merchant = make_merchant(&t);
 
-        // 10_001 should always fail.
+        // 10_001 should always fail (above MAX_FEE_BIPS).
         let result =
             t.client
                 .try_set_merchant_fee_override(&t.admin, &merchant, &10_001u32);

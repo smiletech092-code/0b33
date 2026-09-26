@@ -30,7 +30,7 @@ fn make_funded_subscription(te: &TestEnv, subscriber: &Address, merchant: &Addre
         &None::<u32>,
 );
     te.stellar_token_client().mint(subscriber, &DEPOSIT);
-    te.client.deposit_funds(&sub_id, subscriber, &DEPOSIT);
+    te.client.deposit_funds(&sub_id, &DEPOSIT);
     sub_id
 }
 
@@ -353,7 +353,7 @@ fn operator_charge_usage_succeeds() {
         &None::<u32>,
 );
     te.stellar_token_client().mint(&subscriber, &DEPOSIT);
-    te.client.deposit_funds(&sub_id, &subscriber, &DEPOSIT, &None::<soroban_sdk::BytesN<32>>);
+    te.client.deposit_funds(&sub_id, &DEPOSIT, &None::<soroban_sdk::BytesN<32>>);
 
     te.client.set_operator(&te.admin, &operator);
 
@@ -383,7 +383,7 @@ fn operator_charge_usage_wrong_operator_rejected() {
         &None::<u32>,
 );
     te.stellar_token_client().mint(&subscriber, &DEPOSIT);
-    te.client.deposit_funds(&sub_id, &subscriber, &DEPOSIT, &None::<soroban_sdk::BytesN<32>>);
+    te.client.deposit_funds(&sub_id, &DEPOSIT, &None::<soroban_sdk::BytesN<32>>);
 
     te.client.set_operator(&te.admin, &operator);
 
@@ -434,6 +434,180 @@ fn remove_operator_revokes_single_charge_immediately() {
     te.jump(INTERVAL + 1);
     let result = te.client.try_operator_charge_subscription(&operator, &sub_id);
     assert!(result.is_err());
+}
+
+// ── Revocation in same ledger (no deferred execution) ──────────────────────────
+
+/// Verifies that revocation takes effect **immediately within the same ledger**.
+/// If an operator is revoked and then attempts to charge within the same ledger,
+/// the charge should fail with Unauthorized.
+#[test]
+fn revocation_takes_effect_in_same_ledger_batch_charge() {
+    let te = TestEnv::default();
+    let subscriber = Address::generate(&te.env);
+    let merchant = Address::generate(&te.env);
+    let operator = Address::generate(&te.env);
+
+    let sub_id = make_funded_subscription(&te, &subscriber, &merchant);
+    
+    // Record the initial ledger timestamp before any operations.
+    let initial_timestamp = te.env.ledger().timestamp();
+    
+    // Set the operator.
+    te.client.set_operator(&te.admin, &operator);
+    te.env.ledger().with_mut(|li| {
+        li.timestamp += crate::admin::CONFIG_COOLDOWN_SECS
+    });
+    
+    // Verify operator is set.
+    assert_eq!(te.client.get_operator(), Some(operator.clone()));
+    
+    // Advance time to allow charging.
+    te.jump(INTERVAL + 1);
+    let ledger_before_revocation = te.env.ledger().timestamp();
+    
+    // Remove operator (within the same ledger as the attempted charge).
+    te.client.remove_operator(&te.admin);
+    
+    // Verify operator is no longer set.
+    assert_eq!(te.client.get_operator(), None);
+    
+    // Attempt to charge in the same ledger after revocation.
+    // This should fail because the operator is no longer registered,
+    // not because of nonce or other state. Revocation is immediate.
+    let result = te
+        .client
+        .try_operator_batch_charge(&operator, &vec![&te.env, sub_id], &0u64);
+    
+    assert!(
+        result.is_err(),
+        "operator_batch_charge must fail in the same ledger after revocation"
+    );
+    
+    // Verify the error is Unauthorized (operator check failed),
+    // not some other error like EmergencyStopActive or InvalidInput.
+    match result {
+        Err(Ok(Error::Unauthorized)) => {
+            // Expected: the operator was checked and not found.
+        }
+        other => {
+            panic!(
+                "Expected Error::Unauthorized after revocation in same ledger, got: {:?}",
+                other
+            );
+        }
+    }
+}
+
+/// Verifies that revocation takes effect **immediately within the same ledger**
+/// for single subscription charges.
+#[test]
+fn revocation_takes_effect_in_same_ledger_single_charge() {
+    let te = TestEnv::default();
+    let subscriber = Address::generate(&te.env);
+    let merchant = Address::generate(&te.env);
+    let operator = Address::generate(&te.env);
+
+    let sub_id = make_funded_subscription(&te, &subscriber, &merchant);
+    
+    // Set the operator.
+    te.client.set_operator(&te.admin, &operator);
+    te.env.ledger().with_mut(|li| {
+        li.timestamp += crate::admin::CONFIG_COOLDOWN_SECS
+    });
+    
+    // Verify operator is set.
+    assert_eq!(te.client.get_operator(), Some(operator.clone()));
+    
+    // Advance time to allow charging.
+    te.jump(INTERVAL + 1);
+    
+    // Remove operator (within the same ledger as the attempted charge).
+    te.client.remove_operator(&te.admin);
+    
+    // Verify operator is no longer set.
+    assert_eq!(te.client.get_operator(), None);
+    
+    // Attempt to charge in the same ledger after revocation.
+    let result = te.client.try_operator_charge_subscription(&operator, &sub_id);
+    
+    assert!(
+        result.is_err(),
+        "operator_charge_subscription must fail in the same ledger after revocation"
+    );
+    
+    // Verify the error is Unauthorized.
+    match result {
+        Err(Ok(Error::Unauthorized)) => {
+            // Expected: the operator was checked and not found.
+        }
+        other => {
+            panic!(
+                "Expected Error::Unauthorized after revocation in same ledger, got: {:?}",
+                other
+            );
+        }
+    }
+}
+
+/// Verifies that revocation takes effect **immediately within the same ledger**
+/// for usage charges.
+#[test]
+fn revocation_takes_effect_in_same_ledger_usage_charge() {
+    let te = TestEnv::default();
+    let subscriber = Address::generate(&te.env);
+    let merchant = Address::generate(&te.env);
+    let operator = Address::generate(&te.env);
+
+    let sub_id = te.client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &true, // usage_enabled
+        &None,
+        &None::<u64>,
+        &None::<u32>,
+);
+    te.stellar_token_client().mint(&subscriber, &DEPOSIT);
+    te.client.deposit_funds(&sub_id, &DEPOSIT, &None::<soroban_sdk::BytesN<32>>);
+    
+    // Set the operator.
+    te.client.set_operator(&te.admin, &operator);
+    te.env.ledger().with_mut(|li| {
+        li.timestamp += crate::admin::CONFIG_COOLDOWN_SECS
+    });
+    
+    // Verify operator is set.
+    assert_eq!(te.client.get_operator(), Some(operator.clone()));
+    
+    // Remove operator (within the same ledger as the attempted charge).
+    te.client.remove_operator(&te.admin);
+    
+    // Verify operator is no longer set.
+    assert_eq!(te.client.get_operator(), None);
+    
+    // Attempt to charge usage in the same ledger after revocation.
+    let usage = 500_000i128;
+    let result = te.client.try_operator_charge_usage(&operator, &sub_id, &usage);
+    
+    assert!(
+        result.is_err(),
+        "operator_charge_usage must fail in the same ledger after revocation"
+    );
+    
+    // Verify the error is Unauthorized.
+    match result {
+        Err(Ok(Error::Unauthorized)) => {
+            // Expected: the operator was checked and not found.
+        }
+        other => {
+            panic!(
+                "Expected Error::Unauthorized after revocation in same ledger, got: {:?}",
+                other
+            );
+        }
+    }
 }
 
 // ── Privilege isolation ───────────────────────────────────────────────────────
@@ -670,7 +844,7 @@ fn get_operator_nonce_increments_per_call() {
 
         // Re-fund so the next charge can succeed.
         te.stellar_token_client().mint(&subscriber, &AMOUNT);
-        te.client.deposit_funds(&sub_id, &subscriber, &AMOUNT, &None::<soroban_sdk::BytesN<32>>);
+        te.client.deposit_funds(&sub_id, &AMOUNT, &None::<soroban_sdk::BytesN<32>>);
     }
     assert_eq!(te.client.get_operator_nonce(&operator), 3u64);
 }
@@ -695,7 +869,7 @@ fn operator_charge_usage_with_reference_succeeds() {
         &None::<u32>,
 );
     te.stellar_token_client().mint(&subscriber, &DEPOSIT);
-    te.client.deposit_funds(&sub_id, &subscriber, &DEPOSIT, &None::<soroban_sdk::BytesN<32>>);
+    te.client.deposit_funds(&sub_id, &DEPOSIT, &None::<soroban_sdk::BytesN<32>>);
 
     te.client.set_operator(&te.admin, &operator);
 

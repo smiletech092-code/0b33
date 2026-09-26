@@ -96,18 +96,20 @@ Submit a new governance proposal.
   - `InvalidInput` if quorum_bps > 10000
   - `InvalidInput` if eta ≤ current timestamp
 
-#### `vote_proposal(proposal_id, voted_yes) → ()`
+#### `vote_proposal(proposal_id, voted_yes, nonce) → ()`
 
 Cast a vote on a proposal.
 
 - **Arguments:**
   - `proposal_id`: ID of proposal to vote on
   - `voted_yes`: true for yes, false for no
+  - `nonce`: per-guardian monotonic nonce for replay protection (domain `DOMAIN_GOVERNANCE_VOTE`, value 10)
 
 - **Errors:**
   - `Unauthorized` if caller is not a guardian
   - `NotFound` if proposal doesn't exist
   - `InvalidInput` if proposal already executed
+  - `NonceAlreadyUsed` if the nonce has already been consumed
 
 #### `execute_proposal(proposal_id) → ()`
 
@@ -200,6 +202,12 @@ Get proposal details by ID.
    - Each proposal has unique ID (monotonic allocation)
    - Proposal records are persistent and immutable post-execution
    - No nonce reuse across different proposal types
+   - **Vote replay prevention**: `vote_proposal` consumes a per-guardian monotonic nonce
+     (domain `DOMAIN_GOVERNANCE_VOTE`, value 10). A node that retransmits a signed vote
+     transaction is rejected with `NonceAlreadyUsed` after the first successful consumption.
+     Nonces are stored under `DataKey::AdminNonce(guardian, 10)` in persistent storage and
+     increment by exactly 1 per successful vote. Cross-domain replay is impossible because
+     the domain discriminant is part of the storage key.
 
 5. **Access Control**
    - Guardians managed by admin only
@@ -281,9 +289,9 @@ let proposal_id = client.submit_proposal(
 )?;
 
 // 3. Guardians vote (at least 2 must vote yes)
-client.vote_proposal(proposal_id, true)?;  // Guardian 1
-client.vote_proposal(proposal_id, true)?;  // Guardian 2
-client.vote_proposal(proposal_id, false)?; // Guardian 3
+client.vote_proposal(proposal_id, true, 0)?;  // Guardian 1 (nonce 0)
+client.vote_proposal(proposal_id, true, 0)?;  // Guardian 2 (nonce 0, independent counter)
+client.vote_proposal(proposal_id, false, 0)?; // Guardian 3 (nonce 0, independent counter)
 
 // 4. After ETA, anyone can execute
 client.execute_proposal(proposal_id)?;  // 200 votes > 200 quorum ✓
@@ -298,8 +306,8 @@ client.execute_proposal(proposal_id)?;  // 200 votes > 200 quorum ✓
 client.submit_proposal(..., quorum_bps: 6700, ...)?;
 
 // Guardian 1 and 2 vote yes (200 votes)
-client.vote_proposal(proposal_id, true)?;   // Guardian 1
-client.vote_proposal(proposal_id, true)?;   // Guardian 2
+client.vote_proposal(proposal_id, true, 0)?;   // Guardian 1 (nonce 0)
+client.vote_proposal(proposal_id, true, 0)?;   // Guardian 2 (nonce 0, independent counter)
 
 // Admin removes Guardian 2 mid-vote
 client.remove_guardian(admin, guardian2)?;

@@ -79,6 +79,24 @@ The enum is defined in `contracts/subscription_vault/src/types.rs`. Transition r
 - **How exited:** Successful charge or `resume_subscription` (with sufficient prepaid balance) → Active; later failed attempt after grace expiry → InsufficientBalance; `cancel_subscription` → Cancelled.
 - **Charges:** Allowed to re-attempt charging while grace is active.
 
+#### Exact `GracePeriod` → `InsufficientBalance` predicate
+
+On a failed charge attempt, the transition to `InsufficientBalance` occurs when
+the following inclusive predicate is true:
+
+```text
+now >= last_payment_timestamp + interval_seconds + grace_period_seconds
+```
+
+Here, `now` is the current ledger timestamp, `last_payment_timestamp` is the
+timestamp of the last successful payment, `interval_seconds` is the
+subscription billing interval, and `grace_period_seconds` is the configured
+grace duration. Equality is sufficient: the transition happens at the exact
+boundary, not only after it. If the predicate is false, the subscription stays
+in `GracePeriod` and a later eligible charge may retry. A zero grace duration
+makes the predicate true at the first underfunded eligible charge, so the
+subscription goes directly to `InsufficientBalance`.
+
 ---
 
 ## State Machine and Transitions

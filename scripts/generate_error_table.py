@@ -11,6 +11,17 @@ Without ``--check`` the script rewrites the "## Entrypoint Cross-Reference" sect
 With ``--check`` the script exits with a non-zero status when the file would
 change (used by CI to fail the workflow when the table is stale).
 
+Independently of ``--check``, the script exits non-zero when any ``Error``
+variant present in ``types.rs`` has no entry in the ``REMEDIATION`` map.  A new
+error variant therefore cannot be merged undocumented: CI fails until the
+variant has documented handling, and the generated table stops showing the
+"⚠ No remediation documented" placeholder.
+
+Exit codes:
+    0 — table up to date and every variant documented
+    1 — stale table, and/or undocumented variants present
+    2 — expected path missing, or no variants could be parsed
+
 Algorithm
 ---------
 1.  Parse ``contracts/subscription_vault/src/types.rs`` to extract every
@@ -98,6 +109,9 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "MerchantPaused":                 ("Retry only after merchant pause is removed (unpause_merchant).", "MerchantUnpausedEvent", False),
     "Reentrancy":                     ("Treat as a security failure; investigate calling path immediately.", "—", False),
     "NotInGracePeriod":               ("Refresh state; a grace-period buyout is only legal when status == GracePeriod.", "—", False),
+    "TimelockNotElapsed":             ("Wait until the scheduled effective timestamp; this is a timelock, not an error condition.", "TreasuryChangeScheduledEvent", False),
+    "VacationActive":                 ("Retry after the merchant vacation window ends or the merchant calls unpause_merchant.", "MerchantUnpausedEvent", False),
+    "EmergencyWithdrawInvalidState":  ("Refresh subscription state; emergency withdraw is only valid from the states the policy allows.", "—", False),
     # Accounting
     "InsufficientBalance":            ("Retry only after subscriber deposits funds via deposit_funds.", "FundsDepositedEvent", False),
     "InsufficientPrepaidBalance":     ("Top up subscription via deposit_funds, then retry.", "FundsDepositedEvent", False),
@@ -107,6 +121,8 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "OracleNotConfigured":            ("Admin must call set_oracle_config with a valid oracle address.", "OracleConfigUpdatedEvent", False),
     "OraclePriceUnavailable":         ("Retry only after oracle data feed recovers.", "OracleChargeResolvedEvent", False),
     "OraclePriceStale":               ("Retry only after a fresh oracle quote is published.", "OracleChargeResolvedEvent", False),
+    "OracleDeviationTooHigh":         ("Treat as terminal; the oracle price deviated past the circuit-breaker threshold. Investigate the price feed before retrying.", "OracleChargeResolvedEvent", False),
+    "ProtocolFeeTooHigh":            ("Fix protocol_fee_bps to be at most MAX_PROTOCOL_FEE_BIPS.", "ProtocolFeeUpdatedEvent", False),
     # Limits
     "SubscriptionLimitReached":       ("Treat as terminal capacity failure; no new subscriptions can be created.", "—", False),
     "LifetimeCapReached":             ("Stop charging; surface terminal state to user.", "LifetimeCapReachedEvent", False),
@@ -115,16 +131,14 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "MetadataKeyLimitReached":        ("Delete or update existing keys (up to MAX_METADATA_KEYS) before retrying.", "MetadataDeletedEvent", False),
     "MaxConcurrentSubscriptionsReached": ("Subscriber already at plan concurrency limit; cancel an existing subscription first.", "SubscriptionCancelledEvent", False),
     "CreditLimitExceeded":            ("Reduce deposit / subscription amount or raise limit via set_subscriber_credit_limit.", "—", False),
-    "SubscriberRateLimited":          ("Retry after the per-subscriber rolling 24-hour subscription-creation window resets; throttle limit is configurable.", "—", False),
-    "UsageLimitsRequired":            ("Configure UsageLimits on the subscription via configure_usage_limits before enabling usage-based charges.", "UsageLimitsConfiguredEvent", False),
     "RateLimitExceeded":              ("Retry after the rate window resets (see configure_usage_limits).", "UsageLimitsConfiguredEvent", False),
     "UsageCapExceeded":               ("Retry only after new billing period begins or cap is raised.", "UsageLimitsConfiguredEvent", False),
     "BurstLimitExceeded":             ("Retry after burst_min_interval_secs elapses.", "UsageLimitsConfiguredEvent", False),
-    "MerchantTagLimitExceeded":       ("Reduce the tag list to at most MAX_MERCHANT_TAGS and retry.", "—", False),
     # Merchant config
     "InvalidFeeBips":                 ("Fix fee_bips to be in range [0, 10000].", "MerchantConfigUpdatedEvent", False),
     "InvalidOperations":              ("Fix allowed_operations bitmap to use only valid OP_* bits.", "MerchantConfigUpdatedEvent", False),
     "MustAllowChargeOperation":       ("Set OP_CHARGE bit in allowed_operations; merchants must accept charges.", "MerchantConfigUpdatedEvent", False),
+    "MerchantNotApproved":            ("Request admin approval or disable whitelist mode via set_merchant_whitelist_mode.", "—", False),
     "UnknownMerchantTag":             ("Fix input; call get_tag_allowlist and use only listed tags.", "—", False),
     "DuplicateMerchantTag":           ("Remove the repeated tag from the request and retry.", "—", False),
     # Token
@@ -134,6 +148,7 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "CannotChangeUsageMode":          ("Cannot toggle usage_enabled on an existing subscription; create a new one.", "—", False),
     # Schema migration
     "SchemaMigrationDowngrade":       ("Downgrade rejected; deploy the correct binary version.", "SchemaMigratedEvent", False),
+    "SchemaVersionMismatch":          ("Migration rejected; deploy compatible binary.", "—", False),
     # Dispute / Chargeback
     "DisputeNotFound":                ("Verify dispute ID before retrying.", "—", False),
     "DisputeAlreadyResolved":         ("Inspect existing resolution; do not retry.", "DisputeResolvedEvent", False),
@@ -141,6 +156,36 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "DisputeWindowElapsed":           ("Check auto-resolution rules; dispute can now be resolved.", "—", False),
     "DisputeAlreadyOpen":             ("A dispute is already open for this subscription; wait for resolution.", "DisputeOpenedEvent", False),
     "DisputeAlreadyResponded":        ("Dispute is not in `Open` status; cannot respond twice.", "DisputeRespondedEvent", False),
+    "DisputeOverpay":                  ("Fix the resolution split so total disbursed does not exceed the escrowed amount.", "DisputeResolvedEvent", False),
+    "SubscriberHasOpenDisputes":      ("Resolve the subscriber's open disputes before requesting blocklist removal.", "DisputeResolvedEvent", False),
+    # Subscription transfer (11000-11099)
+    "TransferIntentNotFound":         ("Verify transfer initiation or expiry before retrying.", "—", False),
+    "TransferIntentExpired":          ("Transfer intent has expired; initiate a new transfer.", "—", False),
+    "InvalidTransferTarget":          ("Provide a valid target address (not self).", "—", False),
+    # Cooldown / lifecycle window (12000-12099)
+    "CooldownActive":                 ("Wait for the per-key cooldown to elapse before mutating this config value.", "—", False),
+    "RenewalWindowClosed":            ("The auto-renewal window has closed; cancel and recreate the subscription to resume billing.", "—", False),
+    "EmergencyWithdrawCooldownActive":("Wait for the emergency-withdraw cooldown to elapse before requesting again.", "—", False),
+    "EmergencyWithdrawNotRequested":  ("No open emergency-withdraw request exists, or it was already finalized. Request one first.", "—", False),
+    "EmergencyWithdrawStateChanged":  ("Subscription state changed since the request; read current state and request a new emergency withdraw.", "—", False),
+    # Delegated payer & escrow (13000-13099)
+    "DelegatedPayerGrantNotFound":    ("Create a delegated-payer grant for this subscriber before depositing on their behalf.", "—", False),
+    "DelegatedPayerGrantExpired":     ("Create a fresh delegated-payer grant; the existing one has expired.", "—", False),
+    "DelegatedPayerAmountExceeded":   ("Reduce the deposit to at most the grant's max_amount, or raise the grant limit.", "—", False),
+    "EscrowNotFound":                 ("No cancellation escrow exists for this subscription; verify the subscription id.", "—", False),
+    "EscrowNotReleased":              ("Wait for the cancellation escrow release window to elapse before withdrawing.", "—", False),
+    # Admin rotation (14000-14099)
+    "ProposalNotFound":               ("No admin proposal is active. Call propose_admin first.", "—", False),
+    "ProposalExpired":                ("The 7-day claim window elapsed; call propose_admin again to start a fresh proposal.", "—", False),
+    "InvalidClaimant":                ("Only the proposed new-admin address may call claim_admin_role.", "—", False),
+    "ProposalAlreadyExists":          ("Cancel the active proposal with cancel_admin_proposal before proposing a different admin.", "AdminProposalCancelledEvent", False),
+    "NoActiveProposal":               ("There is no active proposal to cancel; nothing to roll back.", "—", False),
+    "ProposalCooldownActive":         ("Wait for the admin proposal cooldown to elapse before proposing again.", "—", False),
+    # Multi-sig (15000-15099)
+    "MultiSigApprovalRequired":       ("This operation needs multi-sig approval; submit a proposal and gather the required signatures first.", "MultiSigProposalCreatedEvent", False),
+    "MultiSigProposalNotFound":       ("No valid multi-sig proposal matches this operation; create one first.", "MultiSigProposalCreatedEvent", False),
+    "MultiSigQuorumNotReached":       ("Collect more signatures until the threshold is met, then execute.", "MultiSigProposalApprovedEvent", False),
+    "MultiSigProposalExpired":        ("The multi-sig proposal expired; create a new proposal and re-collect signatures.", "—", False),
     # Coupon
     "CouponNotFound":                 ("Verify the coupon code before retrying.", "—", False),
     "CouponExpired":                  ("Coupon has expired; request a new coupon from the merchant.", "CouponCreatedEvent", False),
@@ -194,6 +239,11 @@ _CATEGORY_RANGES = [
     (9000, 9099, "Subscription Update"),
     (9100, 9199, "Schema Migration"),
     (10000, 10099, "Dispute"),
+    (11000, 11099, "Subscription Transfer"),
+    (12000, 12099, "Cooldown"),
+    (13000, 13099, "Delegated Payer"),
+    (14000, 14099, "Admin Rotation"),
+    (15000, 15099, "Multi-Sig"),
 ]
 
 
@@ -461,13 +511,46 @@ def main(argv: list[str] | None = None) -> int:
     current_content = errors_md.read_text(encoding="utf-8")
     is_stale = new_content != current_content
 
+    # ── Undocumented-variant gate (issue #218) ───────────────────────────────
+    # A variant present in `types.rs` but absent from the `REMEDIATION` map has
+    # no documented handling, so integrators receive it with an
+    # "⚠ No remediation documented" cell. That used to be advisory only: the
+    # warning was written into the table but the process still exited 0, so a
+    # new error could be merged with no documentation at all and CI stayed
+    # green. Report it and fail instead.
+    #
+    # In write mode the file is still updated first, so a developer running the
+    # generator locally gets the refreshed table *and* a non-zero exit telling
+    # them the change is incomplete.
+    undocumented_error = bool(undocumented)
+
+    def _report_undocumented() -> None:
+        print(
+            f"FAIL: {len(undocumented)} error variant(s) in types.rs are missing from the "
+            "REMEDIATION map in scripts/generate_error_table.py:",
+            file=sys.stderr,
+        )
+        for name in undocumented:
+            code = next((v.code for v in variants if v.name == name), None)
+            print(f"  - {name} (code {code})", file=sys.stderr)
+        print(
+            "\nAdd each variant to the REMEDIATION map with its recovery action and "
+            "related event, then re-run the generator and commit docs/errors.md.",
+            file=sys.stderr,
+        )
+
     if args.check:
+        if undocumented_error:
+            _report_undocumented()
+            # Continue to the staleness check so both problems are reported at once.
         if is_stale:
             print(
                 "FAIL: docs/errors.md is stale. Run `python scripts/generate_error_table.py` "
                 "and commit the result.",
                 file=sys.stderr,
             )
+            return 1
+        if undocumented_error:
             return 1
         print("OK: docs/errors.md is up to date.")
         return 0
@@ -478,6 +561,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {len(variants)} variants processed, {len(undocumented)} undocumented.")
     else:
         print(f"No changes needed in {errors_md.relative_to(repo_root)}.")
+
+    if undocumented_error:
+        _report_undocumented()
+        return 1
 
     return 0
 

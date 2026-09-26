@@ -139,7 +139,7 @@ fn fund_merchant_balance(
         &None::<u64>,
     );
     token::StellarAssetClient::new(env, token).mint(&subscriber, &DEPOSIT);
-    client.deposit_funds(&sub_id, &subscriber, &DEPOSIT, &None);
+    client.deposit_funds(&sub_id, &DEPOSIT, &None);
     env.ledger().set_timestamp(env.ledger().timestamp() + INTERVAL + 1);
     client.charge_subscription(&sub_id, &None);
 }
@@ -200,7 +200,7 @@ fn bench_withdraw_multi_token() {
         &None::<u64>,
     );
     token::StellarAssetClient::new(&env, &token2).mint(&subscriber2, &DEPOSIT);
-    client.deposit_funds(&sub2, &subscriber2, &DEPOSIT, &None);
+    client.deposit_funds(&sub2, &DEPOSIT, &None);
     env.ledger().set_timestamp(env.ledger().timestamp() + INTERVAL + 1);
     client.charge_subscription(&sub2, &None);
 

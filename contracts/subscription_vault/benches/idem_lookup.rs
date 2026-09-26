@@ -24,7 +24,8 @@
 //!   inserted via `deposit_funds` is *not* replayable via `charge_subscription`
 //!   because the two entrypoints use different domain constants.
 //! * The ring evicts the oldest entry when full, so replay protection is
-//!   bounded to the most-recent `IDEM_HISTORY` keys per subscription.
+//!   bounded to the most-recent `IDEM_HISTORY` keys per subscription within
+//!   the `IDEM_TTL_SECS` time window.
 //! * CPU-cost assertions use a percentage tolerance rather than an absolute
 //!   instruction count so that the test remains stable across SDK upgrades.
 
@@ -38,8 +39,8 @@ use subscription_vault::{SubscriptionVault, SubscriptionVaultClient};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Number of idempotency slots in the ring (must match types::IDEM_HISTORY = 32).
-const RING_SIZE: usize = 32;
+/// Number of idempotency slots in the ring (must match types::IDEM_HISTORY = 64).
+const RING_SIZE: usize = 64;
 
 /// Allowed spread between the cheapest and most-expensive hit position,
 /// expressed as a percentage of the cheapest cost.  We allow 20 % to
@@ -120,7 +121,7 @@ fn create_and_fund(
     let token_admin = token::StellarAssetClient::new(env, token);
     token_admin.mint(subscriber, &(DEPOSIT * 4));
     let no_key: Option<BytesN<32>> = None;
-    client.deposit_funds(&id, subscriber, &DEPOSIT, &no_key);
+    client.deposit_funds(&id, &DEPOSIT, &no_key);
     // Advance time past the interval so the first charge is always valid.
     env.ledger()
         .set_timestamp(env.ledger().timestamp() + INTERVAL + 1);
@@ -144,7 +145,7 @@ fn seed_ring(
     for i in 0..count {
         let key = make_key16(env, i as u16);
         token_admin.mint(subscriber, &MIN_TOPUP);
-        client.deposit_funds(&sub_id, subscriber, &MIN_TOPUP, &Some(key));
+        client.deposit_funds(&sub_id, &MIN_TOPUP, &Some(key));
     }
 }
 
@@ -164,7 +165,7 @@ fn measure_replay_cost(
     token_admin.mint(subscriber, &MIN_TOPUP);
 
     env.budget().reset_default();
-    client.deposit_funds(&sub_id, subscriber, &MIN_TOPUP, &Some(key));
+    client.deposit_funds(&sub_id, &MIN_TOPUP, &Some(key));
     env.budget().cpu_instruction_cost()
 }
 
@@ -255,7 +256,7 @@ fn bench_ring_position_cost() {
     let replay_key = make_key16(&env, 1);
     let token_admin = token::StellarAssetClient::new(&env, &token);
     token_admin.mint(&subscriber, &MIN_TOPUP);
-    client.deposit_funds(&sub_id, &subscriber, &MIN_TOPUP, &Some(replay_key));
+    client.deposit_funds(&sub_id, &MIN_TOPUP, &Some(replay_key));
     let balance_after = client.get_subscription(&sub_id).prepaid_balance;
     assert_eq!(
         balance_before, balance_after,
@@ -282,14 +283,14 @@ fn bench_empty_ring() {
 
     env.budget().reset_default();
     // Inserting into an empty ring: check_key returns false, push_key adds it.
-    client.deposit_funds(&sub_id, &subscriber, &MIN_TOPUP, &Some(key.clone()));
+    client.deposit_funds(&sub_id, &MIN_TOPUP, &Some(key.clone()));
     let cost_insert = env.budget().cpu_instruction_cost();
 
     // Replaying the same key: check_key returns true immediately.
     token_admin.mint(&subscriber, &MIN_TOPUP);
     env.budget().reset_default();
     let bal_before = client.get_subscription(&sub_id).prepaid_balance;
-    client.deposit_funds(&sub_id, &subscriber, &MIN_TOPUP, &Some(key));
+    client.deposit_funds(&sub_id, &MIN_TOPUP, &Some(key));
     let cost_replay = env.budget().cpu_instruction_cost();
     let bal_after = client.get_subscription(&sub_id).prepaid_balance;
 
@@ -331,13 +332,13 @@ fn bench_ring_size_one() {
     let only_key = make_key(&env, 0x01);
     let token_admin = token::StellarAssetClient::new(&env, &token);
     token_admin.mint(&subscriber, &MIN_TOPUP);
-    client.deposit_funds(&sub_id, &subscriber, &MIN_TOPUP, &Some(only_key.clone()));
+    client.deposit_funds(&sub_id, &MIN_TOPUP, &Some(only_key.clone()));
 
     // Replay the single key.
     token_admin.mint(&subscriber, &MIN_TOPUP);
     let bal_before = client.get_subscription(&sub_id).prepaid_balance;
     env.budget().reset_default();
-    client.deposit_funds(&sub_id, &subscriber, &MIN_TOPUP, &Some(only_key));
+    client.deposit_funds(&sub_id, &MIN_TOPUP, &Some(only_key));
     let cost_replay_1 = env.budget().cpu_instruction_cost();
     let bal_after = client.get_subscription(&sub_id).prepaid_balance;
 
@@ -375,14 +376,14 @@ fn bench_duplicate_hash_query() {
     token_admin.mint(&subscriber, &MIN_TOPUP);
     let bal_before = client.get_subscription(&sub_id).prepaid_balance;
     env.budget().reset_default();
-    client.deposit_funds(&sub_id, &subscriber, &MIN_TOPUP, &Some(dup_key.clone()));
+    client.deposit_funds(&sub_id, &MIN_TOPUP, &Some(dup_key.clone()));
     let cost_first_replay = env.budget().cpu_instruction_cost();
     let bal_mid = client.get_subscription(&sub_id).prepaid_balance;
 
     // Second replay (consecutive duplicate).
     token_admin.mint(&subscriber, &MIN_TOPUP);
     env.budget().reset_default();
-    client.deposit_funds(&sub_id, &subscriber, &MIN_TOPUP, &Some(dup_key));
+    client.deposit_funds(&sub_id, &MIN_TOPUP, &Some(dup_key));
     let cost_second_replay = env.budget().cpu_instruction_cost();
     let bal_after = client.get_subscription(&sub_id).prepaid_balance;
 
@@ -436,7 +437,7 @@ fn bench_domain_isolation_no_cross_replay() {
 
     // Insert via deposit_funds (domain = DOMAIN_DEPOSIT_FUNDS).
     token_admin.mint(&subscriber, &MIN_TOPUP);
-    client.deposit_funds(&sub_id, &subscriber, &MIN_TOPUP, &Some(shared_key.clone()));
+    client.deposit_funds(&sub_id, &MIN_TOPUP, &Some(shared_key.clone()));
 
     let bal_after_deposit = client.get_subscription(&sub_id).prepaid_balance;
 
@@ -461,7 +462,7 @@ fn bench_domain_isolation_no_cross_replay() {
     // Now replaying the deposit key via deposit_funds must still be idempotent.
     let bal_before_replay = client.get_subscription(&sub_id).prepaid_balance;
     token_admin.mint(&subscriber, &MIN_TOPUP);
-    client.deposit_funds(&sub_id, &subscriber, &MIN_TOPUP, &Some(shared_key));
+    client.deposit_funds(&sub_id, &MIN_TOPUP, &Some(shared_key));
     let bal_after_replay = client.get_subscription(&sub_id).prepaid_balance;
 
     assert_eq!(

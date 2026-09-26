@@ -16,7 +16,32 @@ pub const MAX_METADATA_KEYS: u32 = 10;
 pub const MAX_METADATA_KEY_LENGTH: u32 = 32;
 /// Maximum length of a metadata value in bytes.
 pub const MAX_METADATA_VALUE_LENGTH: u32 = 256;
-/// Maximum number of subscription IDs accepted by a single bulk pause/cancel call.
+/// Maximum number of subscription IDs accepted by a single batch entrypoint.
+///
+/// Applies to every entrypoint that takes a batch of subscription ids:
+/// `batch_charge`, `bulk_pause_subscriptions`, and
+/// `bulk_cancel_subscriptions`.
+///
+/// # Why this bound exists
+///
+/// A batch is charged sequentially inside a single transaction. Each id costs
+/// a bounded but non-trivial number of instructions (subscription read, fee
+/// maths, token transfer, storage writes, event emission). Because the
+/// per-transaction instruction budget is a *network* limit, not a contract
+/// limit, a batch that is too large does not fail with a contract error — it
+/// fails with a generic `exceeded budget` execution error, which is
+/// indistinguishable from a genuine out-of-gas problem and cannot be
+/// programmatically retried by the caller.
+///
+/// Capping the batch length in the contract turns that ambiguous network-level
+/// failure into a deterministic, catchable contract error *before* any state
+/// is touched, so the caller can split the batch and retry safely.
+///
+/// Callers should treat this as a hard ceiling and plan batches well below it
+/// (the integration guide recommends ~50 ids) so that per-item costs stay
+/// predictable.
+///
+/// Documented for integrators in `docs/batch_charge.md`.
 pub const BATCH_MAX_SIZE: u32 = 100;
 /// Default cap on concurrent active subscriptions per subscriber (#578).
 /// Admins can override this per-subscriber via `DataKey::SubscriberActiveCapOverride`.
@@ -51,24 +76,42 @@ pub const BILLING_PERIOD_SNAPSHOT_TTL_THRESHOLD: u32 = 30 * 24 * 60 * 60; // 30 
 /// Target TTL for billing period snapshot entries when extended.
 pub const BILLING_PERIOD_SNAPSHOT_TTL_EXTEND_TO: u32 = 365 * 24 * 60 * 60; // 365 days
 
-/// Replay protection domain for charge_subscription.
-pub const DOMAIN_CHARGE_INTERVAL: u32 = 0;
-/// Replay protection domain for deposit_funds.
-pub const DOMAIN_DEPOSIT_FUNDS: u32 = 1;
-/// Replay protection domain for charge_one_off.
-pub const DOMAIN_CHARGE_ONEOFF: u32 = 2;
-
-/// Number of idempotent hashes to store per subscription.
-pub const IDEM_HISTORY: u32 = 32;
+/// Number of idempotency slots retained per subscription.
+///
+/// Must stay in sync with `idempotency::IDEM_HISTORY`.
+pub const IDEM_HISTORY: u32 = 64;
 
 /// Maximum fee in basis points (100.00%).
 pub const MAX_FEE_BIPS: i32 = 10000;
 
+/// Oracle price sanity band: minimum allowed price in basis points relative to reference.
+/// A price below this threshold is considered invalid.
+pub const ORACLE_PRICE_MIN_BPS: u32 = 100; // 1% of reference
+
+/// Oracle price sanity band: maximum allowed price in basis points relative to reference.
+/// A price above this threshold is considered invalid.
+pub const ORACLE_PRICE_MAX_BPS: u32 = 1000000; // 10000% of reference
+
+/// Hard cap for the *protocol* fee (5.00%).
+///
+/// `MAX_FEE_BIPS` (10 000) is the absolute ceiling used for per-merchant
+/// fee-bips validation.  Protocol-level fees are capped much lower to
+/// prevent a malicious or mistaken admin from routing all funds to the
+/// treasury.  Any call to `set_protocol_fee` / `queue_treasury_change`
+/// with a value above this limit is rejected with `ProtocolFeeTooHigh`.
+pub const MAX_PROTOCOL_FEE_BIPS: u32 = 500;
+
+/// Oracle price invalid error code.
+pub const ORACLE_PRICE_INVALID_CODE: u32 = 3007;
+
 /// Ring buffer for subscription-scoped idempotency hashes.
+///
+/// Each entry is `(hash, inserted_at_timestamp)`.  Entries older than
+/// `idempotency::IDEM_TTL_SECS` are treated as expired on lookup.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct IdemRingBuffer {
-    pub entries: Vec<BytesN<32>>,
+    pub entries: Vec<(BytesN<32>, u64)>,
     pub cursor: u32,
 }
 
@@ -221,67 +264,73 @@ pub enum DataKey {
     PayoutSchedule(Address),
     /// Pending protocol treasury/fee update queued for a later execution. Discriminant 54.
     PendingTreasuryChange,
-    /// Transfer intent keyed by subscription ID (instance). Discriminant 54.
+    /// Transfer intent keyed by subscription ID (instance). Discriminant 55.
     TransferIntent(u32),
-    /// KYC requirements and merchant status. Discriminant 55.
+    /// KYC requirements and merchant status. Discriminant 56.
     Kyc(KycKey),
-    /// Coupon configuration keyed by code. Discriminant 56.
+    /// Coupon configuration keyed by code. Discriminant 57.
     Coupon(soroban_sdk::Symbol),
-    /// Coupon redemption counter keyed by code. Discriminant 57.
+    /// Coupon redemption counter keyed by code. Discriminant 58.
     CouponRedemptions(soroban_sdk::Symbol),
-    /// Issued credentials keyed by subscription ID. Discriminant 58.
+    /// Issued credentials keyed by subscription ID. Discriminant 59.
     Credential(u32),
     /// Timestamp of the most recent admin-config mutation for a given key label,
     /// hashed to `BytesN<32>` for collision-free per-key cooldown tracking.
-    /// Discriminant 59.
+    /// Discriminant 60.
     AdminConfigLastChangedAt(soroban_sdk::BytesN<32>),
+    /// Per-subscriber creation cap. Discriminant 61.
     SubscriberCreateCap,
-    /// Discriminant 61.
+    /// Per-subscriber create-window state. Discriminant 62.
     SubscriberCreateWindow(Address),
-    /// Merchant allowlist mode flag (instance). Discriminant 62.
+    /// Merchant allowlist mode flag (instance). Discriminant 63.
     MerchantWhitelistMode,
-    /// Approved merchant address (instance). Discriminant 63.
+    /// Approved merchant address (instance). Discriminant 64.
     MerchantApproved(Address),
-    /// Charge salt for replay protection. Discriminant 64.
+    /// Charge salt for replay protection. Discriminant 65.
     ChargeSalt(u32),
-    /// Consecutive charge failure counter per subscription. Discriminant 65.
+    /// Consecutive charge failure counter per subscription. Discriminant 66.
     ChargeFailureCounter(u32),
-    /// Auto-pause threshold (consecutive failures before auto-pause). Discriminant 66.
+    /// Auto-pause threshold (consecutive failures before auto-pause). Discriminant 67.
     AutoPauseThreshold,
-    /// Delegated payer grant keyed by (subscriber, payer). Discriminant 79.
-    DelegatedPayerGrant(Address, Address),
-    /// Split payees details for split-billing. Discriminant 80.
-    SplitPayees(u32),
-    /// Buyout premium in basis points for grace-period recovery. Discriminant 67.
+    /// Buyout premium in basis points for grace-period recovery. Discriminant 68.
     BuyoutPremiumBps,
-    /// Merchant vacation window storing (start_ts, end_ts). Discriminant 62.
+    /// Merchant vacation window storing (start_ts, end_ts). Discriminant 69.
     MerchantVacation(Address),
-    /// Coupon code bound to a subscription (persistent). Discriminant 68.
+    /// Coupon code bound to a subscription (persistent). Discriminant 70.
     SubCoupon(u32),
-    /// Per-merchant multi-sig withdrawal quorum config (instance). Discriminant 69.
+    /// Per-subscription per-coupon redemption flag (persistent). Discriminant 69.
+    /// Tracks whether a specific (subscription_id, coupon_code) pair has been redeemed.
+    SubCouponRedeemed(u32, soroban_sdk::Symbol),
+    /// Per-merchant multi-sig withdrawal quorum config (instance). Discriminant 70.
     MerchantMultiSig(Address),
-    /// Count of a subscriber's currently-`Active` subscriptions (instance). Discriminant 70.
+    /// Count of a subscriber's currently-`Active` subscriptions (instance). Discriminant 72.
     SubscriberActiveCount(Address),
-    /// Admin override of a subscriber's active-subscription cap (instance). Discriminant 71.
+    /// Admin override of a subscriber's active-subscription cap (instance). Discriminant 73.
     SubscriberActiveCapOverride(Address),
     /// Admin-controlled allowlist of valid merchant compliance-category tags (instance,
-    /// global). Discriminant 72.
+    /// global). Discriminant 74.
     TagAllowlist,
     /// Compliance-category tags assigned to a merchant, capped at `MAX_MERCHANT_TAGS`
-    /// (instance). Discriminant 73.
+    /// (instance). Discriminant 75.
     MerchantTags(Address),
     /// Optional fee-token override: when set, protocol fees are paid in this
     /// token instead of the subscription's settlement token, converted through
-    /// the oracle at charge time. Discriminant 74.
+    /// the oracle at charge time. Discriminant 76.
     FeeToken,
-    /// Cancellation refund escrow record keyed by subscription ID. Discriminant 75.
+    /// Cancellation refund escrow record keyed by subscription ID. Discriminant 77.
     CancellationEscrow(u32),
-    /// Per-merchant protocol-fee override in basis points (instance). Discriminant 76.
+    /// Per-merchant protocol-fee override in basis points (instance). Discriminant 78.
     MerchantFeeBps(Address),
-    /// Per-token oracle price history ring-buffer metadata (instance). Discriminant 77.
+    /// Per-token oracle price history ring-buffer metadata (instance). Discriminant 79.
     OraclePriceHistoryMeta(Address),
-    /// Per-token oracle price history ring-buffer entry (instance). Discriminant 78.
+    /// Per-token oracle price history ring-buffer entry (instance). Discriminant 80.
     OraclePriceHistoryEntry(Address, u32),
+    /// Delegated payer grant keyed by (subscriber, payer). Discriminant 81.
+    DelegatedPayerGrant(Address, Address),
+    /// Split payees details for split-billing. Discriminant 82.
+    SplitPayees(u32),
+    /// Emergency-withdraw cooldown lock keyed by subscription ID. Persistent-only.
+    EmergencyWithdrawIntent(u32),
 }
 
 impl DataKey {
@@ -361,16 +410,17 @@ impl DataKey {
             DataKey::AutoPauseThreshold => 66,
             DataKey::BuyoutPremiumBps => 67,
             DataKey::SubCoupon(_) => 68,
-            DataKey::MerchantMultiSig(_) => 69,
-            DataKey::SubscriberActiveCount(_) => 70,
-            DataKey::SubscriberActiveCapOverride(_) => 71,
-            DataKey::TagAllowlist => 72,
-            DataKey::MerchantTags(_) => 73,
-            DataKey::FeeToken => 74,
-            DataKey::CancellationEscrow(_) => 75,
-            DataKey::MerchantFeeBps(_) => 76,
-            DataKey::OraclePriceHistoryMeta(_) => 77,
-            DataKey::OraclePriceHistoryEntry(_, _) => 78,
+            DataKey::SubCouponRedeemed(_, _) => 69,
+            DataKey::MerchantMultiSig(_) => 70,
+            DataKey::SubscriberActiveCount(_) => 71,
+            DataKey::SubscriberActiveCapOverride(_) => 72,
+            DataKey::TagAllowlist => 73,
+            DataKey::MerchantTags(_) => 74,
+            DataKey::FeeToken => 75,
+            DataKey::CancellationEscrow(_) => 76,
+            DataKey::MerchantFeeBps(_) => 77,
+            DataKey::OraclePriceHistoryMeta(_) => 78,
+            DataKey::OraclePriceHistoryEntry(_, _) => 79,
         }
     }
 
@@ -420,28 +470,27 @@ pub const KNOWN_INSTANCE_KEY_DISCRIMINANTS: &[u32] = &[
     51, // NextDisputeId
     52, // SubscriptionDispute(u32)
     53, // PayoutSchedule(Address)
-    54, // TransferIntent(u32)
-    59, // BuyoutPremiumBps
-    61, // MerchantMultiSig(Address)
-    62, // MerchantVacation(Address)
-    59, // AdminConfigLastChangedAt(BytesN<32>)
-    60, // SubscriberCreateCap
-    61, // SubscriberCreateWindow(Address)
-    62, // MerchantWhitelistMode
-    63, // MerchantApproved(Address)
-    64, // ChargeSalt(u32)
-    65, // ChargeFailureCounter(u32)
-    66, // AutoPauseThreshold
-    67, // BuyoutPremiumBps
-    69, // MerchantMultiSig(Address)
-    70, // SubscriberActiveCount(Address)
-    71, // SubscriberActiveCapOverride(Address)
-    72, // TagAllowlist
-    73, // MerchantTags(Address)
-    74, // FeeToken
-    76, // MerchantFeeBps(Address)
-    77, // OraclePriceHistoryMeta(Address)
-    78, // OraclePriceHistoryEntry(Address, u32)
+    54, // PendingTreasuryChange
+    55, // TransferIntent(u32)
+    60, // AdminConfigLastChangedAt(BytesN<32>)
+    61, // SubscriberCreateCap
+    62, // SubscriberCreateWindow(Address)
+    63, // MerchantWhitelistMode
+    64, // MerchantApproved(Address)
+    65, // ChargeSalt(u32)
+    66, // ChargeFailureCounter(u32)
+    67, // AutoPauseThreshold
+    68, // BuyoutPremiumBps
+    69, // MerchantVacation(Address)
+    71, // MerchantMultiSig(Address)
+    72, // SubscriberActiveCount(Address)
+    73, // SubscriberActiveCapOverride(Address)
+    74, // TagAllowlist
+    75, // MerchantTags(Address)
+    76, // FeeToken
+    78, // MerchantFeeBps(Address)
+    79, // OraclePriceHistoryMeta(Address)
+    80, // OraclePriceHistoryEntry(Address, u32)
 ];
 
 /// Returns `true` if `discriminant` is a recognised instance-storage key.
@@ -521,6 +570,11 @@ pub struct Subscription {
     pub grace_start_timestamp: Option<u64>,
     /// Scheduled future cancellation timestamp.
     pub cancel_at: Option<u64>,
+    /// Whether the subscription will continue billing automatically once the
+    /// interval elapses. Disabled subscriptions stop charging until re-enabled.
+    pub auto_renew: bool,
+    /// Timestamp when auto-renewal was last disabled. `None` means enabled.
+    pub auto_renew_disabled_at: Option<u64>,
     /// Optional ledger-sequence bound for expiration. When set, the subscription
     /// also expires as soon as the ledger sequence reaches this value,
     /// independently of the wall-clock `expires_at`. `None` disables the bound.
@@ -531,6 +585,16 @@ pub struct Subscription {
     /// Optional sub-account label for routing charges to an isolated merchant
     /// sub-account ledger (#575). `None` routes to the parent merchant balance.
     pub sub_account_label: Option<Symbol>,
+    /// When true, applies proration to the first billing period: the first charge
+    /// is scaled by (elapsed_seconds / interval_seconds) to reflect partial coverage.
+    /// When false (default), the first charge is always for the full amount regardless
+    /// of when in the interval the subscription starts.
+    pub proration_enabled: bool,
+    /// Threshold for automatic pausing after N consecutive failed charges (InsufficientBalance).
+    /// When set to 0 (default), auto-pause is disabled for this subscription.
+    /// When set to N > 0, the subscription is paused after N consecutive failures.
+    /// High-value subscriptions may use higher thresholds; low-value ones may use lower.
+    pub auto_pause_threshold: u32,
 }
 
 impl Subscription {
@@ -763,7 +827,7 @@ pub struct DisputeResolvedEvent {
     pub schema_version: u32,
 }
 
-/// The privileged action a governance proposal executes once quorum is reached.
+/// Governance proposal types that require multi-sig guardian approval.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProposalKind {
@@ -774,7 +838,16 @@ pub enum ProposalKind {
     SetProtocolFee = 1,
     /// Reserved for a future contract-upgrade action.
     UpgradeContract = 2,
+    /// Enable or disable emergency stop (bool in `target3`).
+    EmergencyStop = 3,
+    /// Recover stranded funds to `Proposal::target` (amount in `target3`).
+    RecoverStrandedFunds = 4,
+    /// Add accepted token `Proposal::target` with decimals in `target3`.
+    AddAcceptedToken = 5,
+    /// Remove accepted token `Proposal::target`.
+    RemoveAcceptedToken = 6,
 }
+
 
 /// A quorum-gated governance proposal.
 #[contracttype]
@@ -899,6 +972,8 @@ pub enum Error {
     InvalidExpiration = 3008,
     /// Oracle price deviation exceeds configured threshold (circuit breaker).
     OracleDeviationTooHigh = 3009,
+    /// Protocol fee exceeds the hard cap (`MAX_PROTOCOL_FEE_BIPS`).
+    ProtocolFeeTooHigh = 3010,
 
     // --- State Transition (4000-4099) ---
     /// The requested state transition is not allowed by the state machine.
@@ -925,7 +1000,8 @@ pub enum Error {
     TimelockNotElapsed = 4011,
     /// Subscription is not in GracePeriod for a buyout operation.
     NotInGracePeriod = 4013,
-    CooldownActive = 4012,
+    /// Emergency withdraw is not valid for the current subscription state.
+    EmergencyWithdrawInvalidState = 4015,
     /// Merchant vacation mode is active — charges blocked during vacation window.
     VacationActive = 4014,
 
@@ -996,6 +1072,8 @@ pub enum Error {
     UnknownMerchantTag = 7005,
     /// The same tag appears more than once in a single `set_merchant_tags` call.
     DuplicateMerchantTag = 7006,
+    /// Merchant tag count exceeds `MAX_MERCHANT_TAGS`.
+    MerchantTagLimitExceeded = 7007,
 
     // --- Token (8000-8099) ---
     /// Token decimals value is invalid (e.g. zero).
@@ -1028,6 +1106,8 @@ pub enum Error {
     DisputeAlreadyResponded = 10006,
     /// Dispute resolution would overpay — total disbursed cannot exceed escrowed amount.
     DisputeOverpay = 10007,
+    /// Blocklist removal is rejected because the subscriber has open disputes.
+    SubscriberHasOpenDisputes = 10008,
 
     // --- Subscription Transfer (11000-11099) ---
     /// The transfer intent was not found or has expired.
@@ -1040,6 +1120,16 @@ pub enum Error {
     // --- Admin Config Cooldown (12000-12099) ---
     /// A protocol-wide config mutation was attempted within the per-key cooldown window.
     CooldownActive = 12001,
+    /// An emergency-withdraw cooldown is still active.
+    EmergencyWithdrawCooldownActive = 12003,
+    /// An emergency-withdraw request is missing or already finalized.
+    EmergencyWithdrawNotRequested = 12004,
+    /// The subscription state changed since the emergency-withdraw request was created.
+    EmergencyWithdrawStateChanged = 12005,
+    // --- Auto-Renewal (12000-12099) ---
+    /// The renewal window (one billing interval after auto_renew was disabled)
+    /// has elapsed; the subscription must be cancelled and recreated to resume billing.
+    RenewalWindowClosed = 12002,
 
     // --- Delegated Payer (13000-13099) ---
     /// The delegated payer grant was not found.
@@ -1048,10 +1138,6 @@ pub enum Error {
     DelegatedPayerGrantExpired = 13002,
     /// The deposit amount exceeds the grant's max_amount.
     DelegatedPayerAmountExceeded = 13003,
-    // --- Auto-Renewal (12000-12099) ---
-    /// The renewal window (one billing interval after auto_renew was disabled)
-    /// has elapsed; the subscription must be cancelled and recreated to resume billing.
-    RenewalWindowClosed = 12001,
 
     // --- Admin Proposal (14000-14099) ---
     /// No admin proposal exists for claiming.
@@ -1064,12 +1150,24 @@ pub enum Error {
     ProposalAlreadyExists = 14004,
     /// No active proposal to cancel.
     NoActiveProposal = 14005,
+    /// The admin proposal cooldown has not elapsed yet.
+    ProposalCooldownActive = 14006,
 
     // --- Cancellation Escrow (13000-13099) ---
     /// No cancellation escrow found for this subscription.
-    EscrowNotFound = 13001,
+    EscrowNotFound = 13004,
     /// The cancellation escrow release window has not elapsed yet.
-    EscrowNotReleased = 13002,
+    EscrowNotReleased = 13005,
+
+    // --- Multi-Sig Enforcement (15000-15099) ---
+    /// Multi-sig approval required for this admin operation.
+    MultiSigApprovalRequired = 15001,
+    /// No valid multi-sig proposal found for this operation.
+    MultiSigProposalNotFound = 15002,
+    /// Multi-sig proposal has not reached quorum yet.
+    MultiSigQuorumNotReached = 15003,
+    /// Multi-sig proposal has expired and cannot be executed.
+    MultiSigProposalExpired = 15004,
 }
 
 impl Error {
@@ -1217,14 +1315,24 @@ pub struct PlanTemplate {
     pub token: Address,
     pub amount: i128,
     pub interval_seconds: u64,
-    /// Optional free-trial period in seconds. During this window the subscriber
-    /// is not charged for the first billing interval. `0` means no trial.
+    /// Legacy trial duration in seconds. `0` means no trial.
     pub trial_seconds: u64,
+    /// Optional free-trial period in seconds. When set, the first charge is
+    /// deferred by this duration. `None` means no trial.
+    pub trial_period_seconds: Option<u64>,
     pub usage_enabled: bool,
     pub lifetime_cap: Option<i128>,
     pub template_key: u32,
     pub version: u32,
     pub is_disabled: bool,
+}
+
+impl PlanTemplate {
+    pub fn effective_trial_period_seconds(&self) -> u64 {
+        self.trial_period_seconds
+            .or((self.trial_seconds > 0).then_some(self.trial_seconds))
+            .unwrap_or(0)
+    }
 }
 
 #[contracttype]
@@ -1266,6 +1374,7 @@ pub struct BillingStatement {
     pub period_end: u64,
     pub amount: i128,
     pub merchant: Address,
+    pub token: Address,
     pub kind: BillingChargeKind,
 }
 
@@ -1273,6 +1382,18 @@ pub struct BillingStatement {
 #[derive(Clone, Debug)]
 pub struct BillingStatementsPage {
     pub statements: Vec<BillingStatement>,
+    pub next_cursor: Option<u32>,
+    pub total: u32,
+}
+
+/// Paginated result for subscription queries with cursor-based pagination.
+///
+/// Used by cursor-based endpoints like `get_subscriptions_by_merchant_paginated` to
+/// return a page of subscription records along with metadata for fetching the next page.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SubscriptionsMerchantPage {
+    pub subscriptions: Vec<Subscription>,
     pub next_cursor: Option<u32>,
     pub total: u32,
 }
@@ -1567,6 +1688,13 @@ pub enum OracleKind {
 pub struct OracleConfig {
     pub enabled: bool,
     pub oracle: Option<Address>,
+    /// The maximum allowed age (in ledger seconds) for a price observation before it is 
+    /// considered stale. 
+    /// 
+    /// **Security Note:** Stellar validators can shift ledger close times within protocol 
+    /// bounds. A very tight staleness window (e.g. under 30-60 seconds) can be manipulated 
+    /// to make fresh prices appear stale, causing legitimate charges to fail with `OraclePriceStale`. 
+    /// It is strongly recommended to set a minimum safe window of at least 60 seconds.
     pub max_age_seconds: u64,
     /// Which pricing strategy to use when resolving charge amounts.
     pub kind: OracleKind,
@@ -1587,7 +1715,6 @@ pub struct OraclePrice {
     pub price: i128,
     pub timestamp: u64,
 }
-
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1714,6 +1841,19 @@ pub struct OperatorRemovedEvent {
 pub struct AdminConfigChangedEvent {
     pub key_label: soroban_sdk::String,
     pub prev_ts: u64,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+/// Emitted when the admin changes the protocol's `min_topup` threshold, so
+/// subscribers whose next deposit falls between the old and new thresholds
+/// can be notified before enforcement kicks in.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MinTopupUpdatedEvent {
+    pub admin: Address,
+    pub old_min_topup: i128,
+    pub new_min_topup: i128,
     pub timestamp: u64,
     pub schema_version: u32,
 }
@@ -2027,6 +2167,15 @@ pub struct GraceBuyoutEvent {
     pub deposit_amount: i128,
     pub charge_amount: i128,
     pub premium_paid: i128,
+    pub timestamp: u64,
+    pub schema_version: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SubscriptionPausedEvent {
+    pub subscription_id: u32,
+    pub paused_by: Address,
     pub timestamp: u64,
     pub schema_version: u32,
 }
@@ -2760,14 +2909,13 @@ pub struct PrepaidQueryResult {
     pub has_more: bool,
 }
 
-
 #[cfg(test)]
 mod event_topic_tests {
     use super::{
         TOPIC_CAP_REACH, TOPIC_CHARGED, TOPIC_CREATED, TOPIC_DEPOSITED, TOPIC_ONE_OFF_CHARGED,
         TOPIC_RECOVERY, TOPIC_WITHDRAWN,
     };
-    use soroban_sdk::{Env, FromVal, Symbol, ToXdr};
+    use soroban_sdk::{xdr::ToXdr, Env, FromVal, Symbol};
 
     /// The emitted wire representation is part of the indexer-facing contract.
     /// Publish every cached short topic in one transaction and compare each

@@ -29,6 +29,8 @@
 .Trashes
 ehthumbs.db
 Thumbs.db
+# Windows executables (e.g., rustup-init.exe)
+*.exe
 
 # IDE / Editor
 .idea/

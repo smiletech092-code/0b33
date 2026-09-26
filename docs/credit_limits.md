@@ -28,6 +28,26 @@ charged in the near term.
 - `get_subscriber_credit_limit(subscriber, token) -> i128`  
   Returns the configured limit, or `0` when none is set.
 
+### Authorization model for limit changes
+
+**Only the contract admin can set or increase a credit limit.** There is no self-service path.
+
+| Caller | Can decrease limit? | Can increase limit? | Can set limit = 0? |
+|--------|--------------------|--------------------|-------------------|
+| Admin (`DataKey::Admin`) | ✓ | ✓ | ✓ |
+| Subscriber (self) | ✗ | ✗ | ✗ |
+| Operator | ✗ | ✗ | ✗ |
+| Merchant | ✗ | ✗ | ✗ |
+| Any other caller | ✗ | ✗ | ✗ |
+
+The implementation in `do_set_subscriber_credit_limit` calls `require_admin_auth(env, &admin)` as its first statement, before any state access. The `admin` parameter is the caller-supplied address; `require_admin_auth` checks it against the stored admin and calls `admin.require_auth()`, so the transaction must carry a valid signature from the current admin. Passing any other address (including the subscriber's own address) returns `Error::Unauthorized`.
+
+**Design rationale:** Allowing subscribers to self-increase their own limits would defeat the purpose of the limit as a risk control. Credit limits exist to protect the protocol and merchants from overextended subscribers; the decision to raise a limit is a trust judgement that belongs exclusively to the admin.
+
+**Lowering a limit** below current exposure is permitted and takes effect immediately. It does not cancel existing subscriptions or claw back prepaid balances — it only blocks future exposure-increasing operations (new subscriptions and deposits) until exposure drops below the new limit.
+
+**Integrator note:** If your frontend needs to request a limit increase on behalf of a subscriber, it must go through an off-chain admin approval flow. The contract provides no on-chain request/approval mechanism for subscriber-initiated limit increases.
+
 ### Enforcement points
 
 Credit limits are enforced before new liabilities are introduced:

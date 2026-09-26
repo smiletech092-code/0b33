@@ -79,7 +79,7 @@ fn create_and_fund(
     // Fund enough for many charges.
     token_admin.mint(&subscriber, &1_000_000_000i128);
     let deposit = 50_000_000i128;
-    client.deposit_funds(&id, &subscriber, &deposit, &None::<soroban_sdk::BytesN<32>>);
+    client.deposit_funds(&id, &deposit, &None::<soroban_sdk::BytesN<32>>);
 
     (id, subscriber, merchant)
 }
@@ -291,7 +291,7 @@ fn test_last_payment_timestamp_zero() {
     );
 
     token_admin.mint(&subscriber, &1_000_000_000i128);
-    client.deposit_funds(&id, &subscriber, &50_000_000i128, &None::<soroban_sdk::BytesN<32>>);
+    client.deposit_funds(&id, &50_000_000i128, &None::<soroban_sdk::BytesN<32>>);
 
     // One second before boundary (interval - 1) → rejected.
     env.ledger().with_mut(|l| l.timestamp = interval - 1);

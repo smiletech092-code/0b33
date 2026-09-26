@@ -16,6 +16,7 @@
 //! | `get_subscription` | Subscription record (subscriber, merchant, balance, status, …) | ✅ Yes | None — no admin secret or timelock exposed |
 //! | `estimate_topup_for_intervals` | Required top-up amount (pure math on subscription.amount) | ✅ Yes | None |
 //! | `get_subscriptions_by_merchant` | Slice of subscription records | ✅ Yes | None |
+//! | `get_subscriptions_by_merchant_paginated` | Paginated subscription records with cursor | ✅ Yes | None |
 //! | `get_merchant_subscription_count` | Index length (u32) | ✅ Yes | None |
 //! | `get_token_subscription_count` | Index length (u32) | ✅ Yes | None |
 //! | `get_subscriptions_by_token` | Slice of subscription records | ✅ Yes | None |
@@ -56,15 +57,18 @@
 //! Reconciliation views (`get_token_reconciliation`, `generate_reconciliation_proof`)
 //! require a valid token address with a deployed token contract; calling them
 //! before init with an arbitrary address will trap on the cross-contract call.
-//! `list_subscriptions_by_subscriber` and `query_prepaid_balances_paginated`
-//! return empty results safely because `DataKey::NextId` defaults to `0`.
+//! `list_subscriptions_by_subscriber` returns empty results safely because a
+//! missing `SubscriberSubs` index defaults to an empty list, and
+//! `query_prepaid_balances_paginated` returns empty results safely because
+//! `DataKey::NextId` defaults to `0`.
 //!
 //! ## Pagination invariants (off-chain / indexers)
 //!
-//! - **`list_subscriptions_by_subscriber`**: Results are ordered by subscription id ascending.
-//!   `start_from_id` is inclusive. Continue with `next_start_id` when present (next id to scan).
-//!   Each call scans at most `MAX_SCAN_DEPTH` IDs — if the scan budget is exhausted before the
-//!   page is full, `next_start_id` is set to the resume point so callers can chain pages.
+//! - **`list_subscriptions_by_subscriber`**: Backed by the `SubscriberSubs` secondary index
+//!   (insertion order, ascending id). `start_from_id` is inclusive. Continue with
+//!   `next_start_id` when present (next id to scan). Each call inspects at most
+//!   `MAX_SCAN_DEPTH` index entries — if the scan budget is exhausted before the page is
+//!   full, `next_start_id` is set to the resume point so callers can chain pages.
 //! - **`get_subscriptions_by_merchant`** / **`get_subscriptions_by_token`**: Results follow the
 //!   order of ids in the on-chain index (`MerchantSubs` / `token_subs`), which is insertion
 //!   order (ascending id order for subscriptions created through this contract). `start` is a
@@ -79,13 +83,14 @@
 //! | `get_subscription` | 1 | Direct key lookup |
 //! | `estimate_topup_for_intervals` | 1 | Calls `get_subscription` |
 //! | `get_subscriptions_by_merchant` | 1 + limit | 1 index read + up to `limit` sub reads |
+//! | `get_subscriptions_by_merchant_paginated` | 1 + limit | 1 index read + up to `limit` sub reads |
 //! | `get_merchant_subscription_count` | 1 | Index length only |
 //! | `get_subscriptions_by_token` | 1 + limit | 1 index read + up to `limit` sub reads |
 //! | `get_token_subscription_count` | 1 | Index length only |
 //! | `compute_next_charge_info` | 0 | Pure computation |
 //! | `get_cap_info` | 1 | Calls `get_subscription` |
 //! | `get_plan_max_active_subs` | 1 | Direct key lookup |
-//! | `list_subscriptions_by_subscriber` | up to MAX_SCAN_DEPTH | Linear scan; capped per call |
+//! | `list_subscriptions_by_subscriber` | 1 + up to MAX_SCAN_DEPTH | 1 index read + capped scan of that subscriber's ids |
 //!
 //! **Index deserialization note**: `get_subscriptions_by_merchant` and
 //! `get_subscriptions_by_token` read the entire index `Vec<u32>` from a single storage
@@ -103,7 +108,10 @@
 
 use crate::safe_math::{safe_mul, safe_sub};
 use crate::subscription::extend_subscription_ttl;
-use crate::types::{CapInfo, DataKey, Error, NextChargeInfo, Subscription, SubscriptionStatus};
+use crate::types::{
+    CapInfo, DataKey, Error, NextChargeInfo, Subscription, SubscriptionStatus,
+    SubscriptionsMerchantPage,
+};
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
 /// Maximum `limit` for [`get_subscriptions_by_merchant`] and [`get_subscriptions_by_token`]
@@ -130,12 +138,28 @@ pub const MAX_SCAN_DEPTH: u32 = 1_000;
 
 pub fn get_subscription(env: &Env, subscription_id: u32) -> Result<Subscription, Error> {
     let key = DataKey::Sub(subscription_id);
-    let sub = env
+    let mut sub: Subscription = env
         .storage()
         .persistent()
         .get(&key)
         .ok_or(Error::NotFound)?;
     extend_subscription_ttl(env, &key);
+
+    // `GracePeriod` is persisted, but the transition out of it only happens on
+    // the next charge attempt. If the grace window has already elapsed with no
+    // charge attempted yet, the stored status is stale — report the effective
+    // status (`InsufficientBalance`) instead of a `GracePeriod` that has
+    // functionally already expired.
+    if sub.status == SubscriptionStatus::GracePeriod {
+        if let Some(grace_start) = sub.grace_start_timestamp {
+            let grace_duration = crate::admin::get_grace_period(env).unwrap_or(0);
+            let grace_expires = grace_start.saturating_add(grace_duration);
+            if grace_duration == 0 || env.ledger().timestamp() >= grace_expires {
+                sub.status = SubscriptionStatus::InsufficientBalance;
+            }
+        }
+    }
+
     Ok(sub)
 }
 
@@ -205,6 +229,75 @@ pub fn get_merchant_subscription_count(env: &Env, merchant: Address) -> u32 {
     let key = DataKey::MerchantSubs(merchant);
     let ids: Vec<u32> = env.storage().instance().get(&key).unwrap_or(Vec::new(env));
     ids.len()
+}
+
+/// Returns subscriptions for a merchant with cursor-based pagination.
+///
+/// # Arguments
+/// - `merchant`: The merchant address whose subscriptions to fetch
+/// - `cursor`: Optional starting position (0-based index into the merchant's subscription list).
+///   Pass `None` to start from the beginning.
+/// - `limit`: Number of subscriptions to return (must be in `1..=MAX_SUBSCRIPTION_LIST_PAGE`)
+///
+/// # Returns
+/// A `SubscriptionsMerchantPage` containing:
+/// - `subscriptions`: Vector of subscription records for this page
+/// - `next_cursor`: Offset to use for the next page (if more results exist)
+/// - `total`: Total number of subscriptions for this merchant
+///
+/// # Errors
+/// - `InvalidInput` if limit is 0 or exceeds `MAX_SUBSCRIPTION_LIST_PAGE`
+///
+/// # Ordering
+/// Results follow insertion order (ascending subscription ID order) from the merchant's index.
+/// Missing subscription records are skipped; use `total` to determine the actual count.
+pub fn get_subscriptions_by_merchant_paginated(
+    env: &Env,
+    merchant: Address,
+    cursor: Option<u32>,
+    limit: u32,
+) -> Result<SubscriptionsMerchantPage, Error> {
+    if limit == 0 || limit > MAX_SUBSCRIPTION_LIST_PAGE {
+        return Err(Error::InvalidInput);
+    }
+
+    let key = DataKey::MerchantSubs(merchant);
+    let ids: Vec<u32> = env.storage().instance().get(&key).unwrap_or(Vec::new(env));
+    let total = ids.len();
+
+    let start = cursor.unwrap_or(0);
+    if start >= total {
+        return Ok(SubscriptionsMerchantPage {
+            subscriptions: Vec::new(env),
+            next_cursor: None,
+            total,
+        });
+    }
+
+    let end = if start + limit > total {
+        total
+    } else {
+        start + limit
+    };
+
+    let mut subscriptions = Vec::new(env);
+    for sub_id in ids.iter().skip(start as usize).take((end - start) as usize) {
+        if let Some(sub) = env
+            .storage()
+            .persistent()
+            .get::<_, Subscription>(&DataKey::Sub(sub_id))
+        {
+            subscriptions.push_back(sub);
+        }
+    }
+
+    let next_cursor = if end < total { Some(end) } else { None };
+
+    Ok(SubscriptionsMerchantPage {
+        subscriptions,
+        next_cursor,
+        total,
+    })
 }
 
 /// Number of subscription ids indexed for this token (length of the `token_subs` list).
@@ -307,8 +400,8 @@ pub fn get_cap_info(env: &Env, subscription_id: u32) -> Result<CapInfo, Error> {
 
     let (remaining_cap, cap_reached) = match sub.lifetime_cap {
         Some(cap) => {
-            let remaining = cap.saturating_sub(sub.lifetime_charged).max(0i128);
-            (Some(remaining), sub.lifetime_charged >= cap)
+            let remaining = crate::subscription::lifetime_cap_remaining(cap, sub.lifetime_charged);
+            (Some(remaining), crate::subscription::lifetime_cap_reached(cap, sub.lifetime_charged))
         }
         None => (None, false),
     };
@@ -350,10 +443,13 @@ pub struct SubscriptionsPage {
 ///
 /// ## Complexity
 ///
-/// O(min(`MAX_SCAN_DEPTH`, `next_id - start_from_id`)) storage reads per call.
-/// At most [`MAX_SCAN_DEPTH`] IDs are inspected; if the scan budget is exhausted
-/// before `limit` matching IDs are found, `next_start_id` is set to the first
-/// unscanned position so the caller can resume with another call.
+/// O(min(`MAX_SCAN_DEPTH`, entries in `DataKey::SubscriberSubs(subscriber)`))
+/// storage reads per call — backed by the per-subscriber secondary index
+/// maintained at subscription creation (and trimmed on cancellation/transfer),
+/// instead of scanning every subscription ID ever issued. At most
+/// [`MAX_SCAN_DEPTH`] index entries are inspected per call; if the budget is
+/// exhausted before `limit` matching IDs are found, `next_start_id` is set to
+/// the first unscanned ID so the caller can resume with another call.
 ///
 /// ## Pagination
 ///
@@ -365,9 +461,9 @@ pub struct SubscriptionsPage {
 /// ## Security note
 ///
 /// The scan cap prevents a single transaction from performing an unbounded number
-/// of storage reads under adversarial conditions (e.g. an account with millions of
-/// subscriptions).  The cap does **not** affect correctness — it only splits work
-/// across more calls.
+/// of storage reads under adversarial conditions (e.g. a subscriber with millions
+/// of historical subscriptions). The cap does **not** affect correctness — it only
+/// splits work across more calls.
 pub fn list_subscriptions_by_subscriber(
     env: &Env,
     subscriber: Address,
@@ -378,41 +474,33 @@ pub fn list_subscriptions_by_subscriber(
         return Err(Error::InvalidInput);
     }
 
-    let next_id: u32 = crate::admin::read_config(env, &DataKey::NextId).unwrap_or(0);
-
-    // Cap the scan window to MAX_SCAN_DEPTH IDs per call.
-    // If the budget is exhausted before `limit` matches are found, `next_start_id`
-    // is set to `scan_end` so the caller can resume from exactly where we stopped.
-    let scan_end: u32 = start_from_id.saturating_add(MAX_SCAN_DEPTH).min(next_id);
+    let index: Vec<u32> = env
+        .storage()
+        .instance()
+        .get(&DataKey::SubscriberSubs(subscriber))
+        .unwrap_or(Vec::new(env));
 
     let mut subscription_ids = Vec::new(env);
     let mut next_start_id: Option<u32> = None;
+    let mut scanned: u32 = 0;
 
-    for id in start_from_id..scan_end {
-        if let Some(sub) = env
-            .storage()
-            .persistent()
-            .get::<_, Subscription>(&DataKey::Sub(id))
-        {
-            if sub.subscriber == subscriber {
-                if subscription_ids.len() < limit {
-                    subscription_ids.push_back(id);
-                } else {
-                    // Page is full; resume from this ID on the next call.
-                    next_start_id = Some(id);
-                    return Ok(SubscriptionsPage {
-                        subscription_ids,
-                        next_start_id,
-                    });
-                }
-            }
+    for id in index.iter() {
+        if id < start_from_id {
+            continue;
         }
-    }
+        if scanned >= MAX_SCAN_DEPTH {
+            next_start_id = Some(id);
+            break;
+        }
+        scanned += 1;
 
-    // Scan budget exhausted.  If more IDs remain beyond the window, signal the
-    // caller to resume from `scan_end` (even if the current page is not full).
-    if scan_end < next_id {
-        next_start_id = Some(scan_end);
+        if subscription_ids.len() < limit {
+            subscription_ids.push_back(id);
+        } else {
+            // Page is full; resume from this ID on the next call.
+            next_start_id = Some(id);
+            break;
+        }
     }
 
     Ok(SubscriptionsPage {
@@ -463,8 +551,7 @@ pub fn get_token_reconciliation(env: &Env, token: Address) -> TokenLiabilities {
     let total_prepaid = compute_total_prepaid(env, &token);
 
     // Compute total merchant liabilities using precomputed total_prepaid
-    let total_merchant_liabilities =
-        compute_total_merchant_liabilities(env, &token, total_prepaid);
+    let total_merchant_liabilities = compute_total_merchant_liabilities(env, &token, total_prepaid);
 
     // Recoverable is the difference between contract balance and accounted funds
     let accounted = total_prepaid
@@ -472,9 +559,7 @@ pub fn get_token_reconciliation(env: &Env, token: Address) -> TokenLiabilities {
         .unwrap_or(0i128);
     let recoverable_amount = contract_balance.saturating_sub(accounted).max(0i128);
 
-    let computed_total = accounted
-        .checked_add(recoverable_amount)
-        .unwrap_or(0i128);
+    let computed_total = accounted.checked_add(recoverable_amount).unwrap_or(0i128);
 
     let is_balanced = contract_balance == computed_total;
 

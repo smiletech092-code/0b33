@@ -21,6 +21,7 @@ fn append_known_sequence(env: &Env, contract_id: &Address, subscription_id: u32,
     let mut total = 0i128;
     env.as_contract(contract_id, || {
         let merchant = Address::generate(env);
+        let token = Address::generate(env);
         for i in 0..count {
             let amount = 100i128 * (i as i128 + 1);
             let kind = match i % 3 {
@@ -33,6 +34,7 @@ fn append_known_sequence(env: &Env, contract_id: &Address, subscription_id: u32,
                 subscription_id,
                 amount,
                 merchant.clone(),
+                token.clone(),
                 kind,
                 i as u64,
                 i as u64 + 1000,

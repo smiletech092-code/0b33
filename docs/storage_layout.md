@@ -89,6 +89,35 @@ This behavior is pinned by `contracts/subscription_vault/tests/ttl_exhaustion.rs
 - a read at the last live ledger re-extends the TTL and restores access past the original window;
 - a second full TTL cycle preserves the record byte-for-byte, then expires again once unrefreshed.
 
+### 3. Idempotency Ring Buffers
+
+Each subscription has a typed idempotency key, `DataKey::IdemKey(subscription_id)`.
+The key is stored in **instance storage** and maps to an `IdemRingBuffer`, not to
+the persistent `DataKey::Sub(subscription_id)` record.
+
+```rust
+pub struct IdemRingBuffer {
+    pub entries: Vec<(BytesN<32>, u64)>,  // (hash, inserted_at_timestamp)
+    pub cursor: u32,
+}
+```
+
+`entries` contains tuples of `(domain-separated SHA-256 fingerprint, ledger timestamp at insertion)`.
+The buffer retains at most `IDEM_HISTORY = 64` entries per subscription.
+When full, inserting a new fingerprint silently overwrites the oldest slot at `cursor`;
+the cursor then advances modulo `IDEM_HISTORY`.
+
+Entries older than `IDEM_TTL_SECS = 7 days` are skipped on lookup and treated as absent,
+regardless of ring position. Replay protection is therefore bounded by **both** time and count:
+a key is protected for up to 7 days from insertion, or until 64 newer keys have overwritten
+its slot — whichever comes first. A missing key (empty buffer or deserialization failure
+from a pre-migration on-chain buffer) initializes to an empty buffer on the first insertion.
+
+The hash includes the operation domain, subscription ID, and raw 32-byte key,
+so the same raw key used by different entrypoints does not collide. The
+idempotency buffer follows the instance-storage lifecycle and is separate from
+the subscription record's persistent-storage TTL extension rules.
+
 ---
 
 ## Known-Instance-Key Allowlist (defensive write guard)

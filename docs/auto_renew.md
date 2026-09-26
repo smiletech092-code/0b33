@@ -91,10 +91,44 @@ Any other caller receives `Error::Forbidden` (1002).
 
 ---
 
+## Merchant Blocklist Behavior During Renewal
+
+When auto-renewal would trigger a charge (i.e., `auto_renew = true` and the
+interval has elapsed), the contract checks the **merchant's blocklist status** at
+renewal time. If the merchant is blocklisted:
+
+- The renewal charge **fails** with `SubscriberBlocklisted` or
+  `MerchantBlocklisted` error (depending on which party is blocklisted).
+- The subscription transitions to `GracePeriod` or `InsufficientBalance`
+  depending on grace period configuration.
+- The subscriber is notified via `SubscriptionChargeFailedEvent`.
+
+**Security implication:** A merchant cannot use auto-renewal to accept payments
+if they have been subsequently blocklisted. This prevents collusion where a
+merchant accepts a subscription, then is blocklisted, and attempts to charge
+via scheduled renewal. The contract enforces compliance at charge time, not at
+subscription creation time.
+
+**Example scenario:**
+1. Subscriber creates auto-renewing subscription with merchant on Day 1
+   (merchant is in good standing).
+2. On Day 30, the interval elapses and renewal is scheduled.
+3. Between Day 30 and the charge execution, the merchant is added to the
+   blocklist due to compliance violation.
+4. When the charge executes on Day 30, it checks the blocklist and fails with
+   `MerchantBlocklisted`.
+
+---
+
 ## Billing Engine Integration
 
-In `charge_core.rs`, after the interval guard (which still fires normally), an
-additional check short-circuits charges when `auto_renew = false`:
+In `charge_core.rs`, the charge flow includes multiple guards:
+
+1. **Merchant paused/vacation checks** — block if merchant is paused or on vacation
+2. **Blocklist checks** — block if subscriber, merchant, or split payees are blocklisted
+3. **Expiration checks** — block if subscription has expired
+4. **Auto-renewal gate** — silently skip the charge if `auto_renew = false` and
+   the interval has elapsed:
 
 ```
 if !sub.auto_renew && now >= next_allowed_charge_time {

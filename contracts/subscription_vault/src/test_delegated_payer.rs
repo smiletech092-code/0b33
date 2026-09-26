@@ -264,7 +264,7 @@ fn test_deposit_on_behalf_recovery_ready() {
     let max_amount: i128 = 200_000;
     client.grant_delegated_payer(&subscriber, &payer, &expires_at, &max_amount);
 
-    client.deposit_funds(&sub_id, &subscriber, &5_000, &None);
+    client.deposit_funds(&sub_id, &5_000, &None);
 
     let _ = client.charge_subscription(&sub_id, &None);
 

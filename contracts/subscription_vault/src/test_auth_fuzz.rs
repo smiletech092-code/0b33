@@ -183,7 +183,7 @@ impl FuzzHarness {
                 std::format!("{:?}", self.client.try_disable_emergency_stop(&address))
             }
             Operation::DepositFunds => {
-                std::format!("{:?}", self.client.try_deposit_funds(&self.subscription_id, &address, &5_000_000))
+                std::format!("{:?}", self.client.try_deposit_funds(&self.subscription_id, &5_000_000))
             }
             Operation::CancelSubscription => {
                 std::format!("{:?}", self.client.try_cancel_subscription(&self.subscription_id, &address))
@@ -199,20 +199,20 @@ impl FuzzHarness {
             }
             Operation::ChargeOneOff => {
                 self.env.mock_all_auths(); 
-                let _ = self.client.try_deposit_funds(&self.subscription_id, &self.subscriber, &20_000_000);
+                let _ = self.client.try_deposit_funds(&self.subscription_id, &20_000_000);
                 if !is_allowed { self.env.mock_auths(&[]); }
                 std::format!("{:?}", self.client.try_charge_one_off(&self.subscription_id, &address, &1_000_000))
             }
             Operation::WithdrawSubscriberFunds => {
                 self.env.mock_all_auths();
-                let _ = self.client.try_deposit_funds(&self.subscription_id, &self.subscriber, &10_000_000);
+                let _ = self.client.try_deposit_funds(&self.subscription_id, &10_000_000);
                 let _ = self.client.try_cancel_subscription(&self.subscription_id, &self.subscriber);
                 if !is_allowed { self.env.mock_auths(&[]); }
                 std::format!("{:?}", self.client.try_withdraw_subscriber_funds(&self.subscription_id, &address))
             }
             Operation::WithdrawMerchantFunds => {
                 self.env.mock_all_auths();
-                let _ = self.client.try_deposit_funds(&self.subscription_id, &self.subscriber, &50_000_000);
+                let _ = self.client.try_deposit_funds(&self.subscription_id, &50_000_000);
                 let _ = self.client.try_charge_one_off(&self.subscription_id, &self.merchant, &10_000_000);
                 if !is_allowed { self.env.mock_auths(&[]); }
                 std::format!("{:?}", self.client.try_withdraw_merchant_funds(&address, &1_000_000))
@@ -228,7 +228,7 @@ impl FuzzHarness {
             }
             Operation::MerchantRefund => {
                 self.env.mock_all_auths();
-                let _ = self.client.try_deposit_funds(&self.subscription_id, &self.subscriber, &50_000_000);
+                let _ = self.client.try_deposit_funds(&self.subscription_id, &50_000_000);
                 let _ = self.client.try_charge_one_off(&self.subscription_id, &self.merchant, &10_000_000);
                 if !is_allowed { self.env.mock_auths(&[]); }
                 std::format!("{:?}", self.client.try_merchant_refund(&address, &self.subscriber, &self.token, &1_000_000))
@@ -238,7 +238,7 @@ impl FuzzHarness {
             }
             Operation::PartialRefund => {
                 self.env.mock_all_auths();
-                let _ = self.client.try_deposit_funds(&self.subscription_id, &self.subscriber, &50_000_000);
+                let _ = self.client.try_deposit_funds(&self.subscription_id, &50_000_000);
                 let _ = self.client.try_charge_one_off(&self.subscription_id, &self.merchant, &10_000_000);
                 if !is_allowed { self.env.mock_auths(&[]); }
                 std::format!("{:?}", self.client.try_partial_refund(&address, &self.subscription_id, &self.subscriber, &1_000_000))

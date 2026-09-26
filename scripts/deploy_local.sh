@@ -10,6 +10,7 @@
 #   ./scripts/deploy_local.sh                       # full setup (Docker + deploy)
 #   ./scripts/deploy_local.sh --no-docker            # skip Docker, use existing network
 #   ./scripts/deploy_local.sh --skip-smoke           # skip the lifecycle smoke test
+#   ./scripts/deploy_local.sh --allow-protocol-mismatch   # warn instead of fail on protocol mismatch
 #   ./scripts/deploy_local.sh --help                 # print help and exit
 #
 # On re-run, the script re-uses any existing Docker container, CLI identity,
@@ -23,11 +24,16 @@
 #   NETWORK_NAME      Network alias (default: local-dev)
 #   RPC_URL           Soroban RPC URL (default: http://localhost:8000/soroban/rpc)
 #   NETWORK_PASSPHRASE (default: "Standalone Network ; February 2017")
+#   QUICKSTART_IMAGE  Override the pinned quickstart image (see QUICKSTART_IMAGE below)
+#   EXPECTED_PROTOCOL_VERSION
+#                     Override the expected Soroban protocol version
+#                     (default: major of soroban-sdk in the contract Cargo.toml)
 #
 # Exit codes:
 #   0 — success
 #   1 — dependency missing or configuration error
 #   2 — build or deploy failure
+#   3 — Soroban protocol version mismatch
 
 set -eu
 
@@ -60,10 +66,32 @@ MERCHANT_IDENTITY="merchant-local"
 TOKEN_DECIMALS=7
 NETWORK_CONTAINER="stellabill-local"
 
+# ── Pinned quickstart image (issue #216) ─────────────────────────────────────
+# The local Soroban network MUST come from a known-good, immutable image.
+# `stellar/quickstart:testing` is a MOVING tag — it is re-pushed whenever a new
+# stellar release lands, so an unpinned pull can silently change the Soroban
+# protocol version underneath a contract WASM that was compiled and tested
+# against a different one. The symptom is a smoke test that fails for no
+# visible reason, or worse, passes while exercising a different protocol.
+#
+# The pin below is tag *and* manifest digest, so the image is reproducible even
+# if the tag is later re-pushed. Bump it deliberately, in a reviewed commit, and
+# re-run the smoke test when you do.
+#
+# Digest: sha256:427069406fbbe2ecd091f75d5a9c1e588ac3108875dec6ab6e0e2ac9f76c311e
+QUICKSTART_IMAGE="${QUICKSTART_IMAGE:-stellar/quickstart:v670-b1459.1-testing@sha256:427069406fbbe2ecd091f75d5a9c1e588ac3108875dec6ab6e0e2ac9f76c311e}"
+
+# Expected Soroban protocol version. Defaults to the major version of
+# soroban-sdk the contract is built against (see sdk_major_from_cargo), because
+# a contract compiled for protocol N cannot be trusted on a network running a
+# different protocol. Overridable for deliberate upgrades.
+EXPECTED_PROTOCOL_VERSION="${EXPECTED_PROTOCOL_VERSION:-}"
+
 # ── Flags ───────────────────────────────────────────────────────────────────
 SKIP_SMOKE=false
 NO_DOCKER=false
 CLEANUP_CONTAINER=false
+ALLOW_PROTOCOL_MISMATCH=false
 
 # ── Cleanup trap ────────────────────────────────────────────────────────────
 cleanup() {
@@ -90,6 +118,9 @@ calls init as a smoke test.
 OPTIONS:
   --no-docker        Skip Docker container start; assume network is already running
   --skip-smoke       Skip the full subscription lifecycle smoke test
+  --allow-protocol-mismatch
+                     Warn (instead of exit 3) when the network's Soroban
+                     protocol version differs from the expected one
   --help             Show this help message and exit
 
 ENVIRONMENT VARIABLES:
@@ -99,6 +130,9 @@ ENVIRONMENT VARIABLES:
   NETWORK_NAME      Network alias used by the CLI (default: local-dev)
   RPC_URL           Soroban RPC endpoint (default: http://localhost:8000/soroban/rpc)
   NETWORK_PASSPHRASE (default: "Standalone Network ; February 2017")
+  QUICKSTART_IMAGE  Pinned quickstart image (tag@digest); see script header
+  EXPECTED_PROTOCOL_VERSION
+                     Expected Soroban protocol version (default: soroban-sdk major)
 EOF
     exit 0
 }
@@ -183,7 +217,7 @@ check_docker() {
             "ERROR: Docker not found." \
             "" \
             "The local Soroban network requires a container running" \
-            "stellar/quickstart:testing." \
+            "the pinned stellar/quickstart image (see QUICKSTART_IMAGE)." \
             "" \
             "Install Docker: https://docs.docker.com/get-docker/" \
             "Or re-run with --no-docker if you already have a network." \
@@ -191,6 +225,26 @@ check_docker() {
         exit 1
     fi
     ok "Docker: $(docker --version 2>/dev/null)"
+}
+
+check_docker_daemon() {
+    if ! docker info >/dev/null 2>&1; then
+        printf '%s\n' \
+            "ERROR: Docker daemon is not running." \
+            "" \
+            "The docker binary was found, but the daemon is not available." \
+            "" \
+            "Start the Docker daemon:" \
+            "  • Linux: systemctl start docker  (or use your init system)" \
+            "  • macOS: open -a Docker" \
+            "  • Windows: Start Docker Desktop" \
+            "" \
+            "If you have a network running locally without Docker," \
+            "use: ./scripts/deploy_local.sh --no-docker" \
+            >&2
+        exit 1
+    fi
+    ok "Docker daemon is running."
 }
 
 # =============================================================================
@@ -225,32 +279,144 @@ build_contract() {
 # =============================================================================
 # STEP 2 — Start / verify local network
 # =============================================================================
+
+# Major version of `soroban-sdk` the contract is built against.
+# Read from the contract Cargo.toml so the expected protocol version can never
+# drift from the SDK the WASM was actually compiled with.
+sdk_major_from_cargo() {
+    manifest="${CONTRACT_DIR}/Cargo.toml"
+    if [ ! -f "${manifest}" ]; then
+        warn "Cannot read ${manifest}; cannot derive expected protocol version."
+        return 0
+    fi
+    # First soroban-sdk dependency line, e.g. soroban-sdk = "22.0.0"
+    sed -n 's/^[[:space:]]*soroban-sdk[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' \
+        "${manifest}" | head -1 | cut -d. -f1
+}
+
+# Query the Soroban protocol version advertised by the running network.
+rpc_protocol_version() {
+    curl -sS -m 15 -X POST \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"getLedgerInfo"}' \
+        "${RPC_URL}" 2>/dev/null | sed -n 's/.*"protocol_version"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9][0-9]*\)"\{0,1\}.*/\1/p' | head -1
+}
+
+# Fail loudly when the network's Soroban protocol version is not the one the
+# contract was compiled and tested against. A mismatch means the smoke test
+# below is exercising a protocol the contract was never validated on, which is
+# exactly the "silent smoke-test failure" this guard prevents.
+verify_protocol_version() {
+    expected="${EXPECTED_PROTOCOL_VERSION}"
+    if [ -z "${expected}" ]; then
+        expected="$(sdk_major_from_cargo)"
+    fi
+
+    if [ -z "${expected}" ]; then
+        warn "SKIP protocol check: no expected version (set EXPECTED_PROTOCOL_VERSION)."
+        return 0
+    fi
+
+    actual="$(rpc_protocol_version)"
+    if [ -z "${actual}" ]; then
+        warn "SKIP protocol check: could not read protocol_version from ${RPC_URL}."
+        return 0
+    fi
+
+    if [ "${actual}" = "${expected}" ]; then
+        PROTOCOL_VERSION_REPORTED="${actual}"
+        ok "Soroban protocol version: ${actual} (expected ${expected})."
+        return 0
+    fi
+
+    # ── Mismatch ──
+    PROTOCOL_VERSION_REPORTED="${actual}"
+    err "==========================================================="
+    err " SOROBAN PROTOCOL VERSION MISMATCH"
+    err "==========================================================="
+    err ""
+    err "  Network reports : protocol ${actual}"
+    err "  Contract expects : protocol ${expected}"
+    err "  Pinned image     : ${QUICKSTART_IMAGE}"
+    err ""
+    err "  The contract WASM was compiled against protocol ${expected}"
+    err "  but the local network is running protocol ${actual}."
+    err "  A protocol change can alter host function semantics, so the"
+    err "  smoke test below would not be validating this contract."
+    err ""
+
+    if [ "${ALLOW_PROTOCOL_MISMATCH}" = "true" ]; then
+        warn "  --allow-protocol-mismatch given: continuing as a WARNING."
+        warn "  Smoke-test results are NOT trustworthy under this mismatch."
+        return 0
+    fi
+
+    err "  Fix by one of:"
+    err "    1. Start a network matching the contract (remove the stale container):"
+    err "         docker rm -f ${NETWORK_CONTAINER}"
+    err "    2. Override the pinned image to one running protocol ${expected}:"
+    err "         QUICKSTART_IMAGE=stellar/quickstart:<tag>@<digest> $0"
+    err "    3. If the contract was intentionally upgraded, update"
+    err "       contracts/subscription_vault/Cargo.toml (soroban-sdk), re-test,"
+    err "       then re-pin QUICKSTART_IMAGE in this script."
+    err "    4. To proceed anyway and inspect the failure:"
+    err "         $0 --allow-protocol-mismatch"
+    err ""
+    exit 3
+}
+
+# Verify a pre-existing container is running the pinned image. Reusing a
+# container started from a different image would bypass the pin entirely.
+verify_container_image() {
+    running_image="$(docker inspect -f '{{.Config.Image}}' "${NETWORK_CONTAINER}" 2>/dev/null || true)"
+    [ -n "${running_image}" ] || return 0
+
+    if [ "${running_image}" = "${QUICKSTART_IMAGE}" ]; then
+        return 0
+    fi
+
+    err "Container '${NETWORK_CONTAINER}' is running a different image:"
+    err "  running : ${running_image}"
+    err "  expected: ${QUICKSTART_IMAGE}"
+    err ""
+    err "Reusing it would bypass the pinned image and the protocol check."
+    err "Recreate it with:"
+    err "  docker rm -f ${NETWORK_CONTAINER} && $0"
+    exit 3
+}
+
 ensure_network() {
     if [ "${NO_DOCKER}" = "true" ]; then
         info "Skipping Docker (--no-docker). Checking network reachability..."
         wait_for_rpc 10
+        verify_protocol_version
         return 0
     fi
 
     if docker inspect "${NETWORK_CONTAINER}" >/dev/null 2>&1; then
+        verify_container_image
         container_running="$(docker inspect -f '{{.State.Running}}' "${NETWORK_CONTAINER}" 2>/dev/null)"
         if [ "${container_running}" = "true" ]; then
             info "Docker container '${NETWORK_CONTAINER}' already running."
             wait_for_rpc 30
+            verify_protocol_version
             return 0
         else
             info "Container '${NETWORK_CONTAINER}' exists but is stopped. Starting..."
             run docker start "${NETWORK_CONTAINER}"
             wait_for_rpc 30
+            verify_protocol_version
             return 0
         fi
     fi
 
     info "Starting Stellar quickstart container (detached)..."
+    info "  image: ${QUICKSTART_IMAGE}"
+    # shellcheck disable=SC2086
     run docker run -d \
         --name "${NETWORK_CONTAINER}" \
         -p 8000:8000 \
-        stellar/quickstart:testing \
+        "${QUICKSTART_IMAGE}" \
         --standalone \
         --enable-soroban
 
@@ -258,6 +424,7 @@ ensure_network() {
     CLEANUP_CONTAINER=true
 
     wait_for_rpc 60
+    verify_protocol_version
     ok "Local Stellar network ready at ${RPC_URL}"
 }
 
@@ -515,6 +682,30 @@ verify_deployment() {
 # =============================================================================
 # STEP 9 — Full subscription lifecycle smoke test
 # =============================================================================
+
+# Merchant's on-chain (wallet) token balance, used to prove that
+# withdraw_merchant_funds actually moved funds to the merchant.
+merchant_token_balance() {
+    "${CLI}" lab token balance \
+        --network "${NETWORK_NAME}" \
+        --asset "native" \
+        --address "${MERCHANT_ADDR}" 2>/dev/null | tr -dc '0-9' | head -c 40
+}
+
+# Merchant's withdrawable balance held inside the vault (not yet withdrawn).
+merchant_vault_balance() {
+    out=$("${CLI}" contract invoke \
+        --network "${NETWORK_NAME}" \
+        --id "${CONTRACT_ID}" \
+        -- \
+        get_merchant_balance \
+        --merchant "${MERCHANT_ADDR}" \
+        2>&1 || true)
+    # The CLI echoes the i128 result on its own line; take the last
+    # standalone integer so echoed argument values are not mistaken for it.
+    echo "${out}" | grep -oE '^[0-9]+$' | tail -1
+}
+
 smoke_test() {
     step "Smoke test: full subscription lifecycle..."
 
@@ -620,6 +811,84 @@ smoke_test() {
         ok "Charge succeeded."
     fi
 
+    # 9g. Earn merchant balance, then withdraw it.
+    #
+    # The interval charge above is expected to fail on a fresh subscription
+    # (interval has not elapsed), so it cannot be relied on to produce merchant
+    # earnings. `charge_one_off` is merchant-authorised and debits prepaid
+    # balance immediately, so it gives the withdrawal path real earnings to
+    # move — which is what this step is here to regression-test.
+    info "Creating merchant earnings via charge_one_off (100000)..."
+    ONE_OFF_RESULT=$("${CLI}" contract invoke \
+        --network "${NETWORK_NAME}" \
+        --source "${MERCHANT_IDENTITY}" \
+        --id "${CONTRACT_ID}" \
+        -- \
+        charge_one_off \
+        --subscription_id "${SUB_ID}" \
+        --merchant "${MERCHANT_ADDR}" \
+        --amount 100000 \
+        2>&1 || true)
+
+    if echo "${ONE_OFF_RESULT}" | grep -qi "error"; then
+        warn "charge_one_off failed: ${ONE_OFF_RESULT}"
+        warn "Cannot verify withdrawal without earnings. Skipping 9h/9i."
+    else
+        ok "charge_one_off succeeded."
+
+        # 9h. Withdraw merchant funds
+        MERCHANT_BAL_BEFORE=$(merchant_vault_balance)
+        MERCHANT_TOKEN_BEFORE=$(merchant_token_balance)
+        info "Merchant vault balance before:  ${MERCHANT_BAL_BEFORE:-unknown}"
+        info "Merchant token balance before: ${MERCHANT_TOKEN_BEFORE:-unknown}"
+
+        WITHDRAW_AMOUNT="${MERCHANT_BAL_BEFORE:-0}"
+        if [ "${WITHDRAW_AMOUNT}" = "0" ]; then
+            warn "No withdrawable merchant balance. Skipping withdrawal check."
+        else
+            info "Withdrawing ${WITHDRAW_AMOUNT} to merchant..."
+            WITHDRAW_RESULT=$("${CLI}" contract invoke \
+                --network "${NETWORK_NAME}" \
+                --source "${MERCHANT_IDENTITY}" \
+                --id "${CONTRACT_ID}" \
+                -- \
+                withdraw_merchant_funds \
+                --merchant "${MERCHANT_ADDR}" \
+                --amount "${WITHDRAW_AMOUNT}" \
+                2>&1 || true)
+
+            if echo "${WITHDRAW_RESULT}" | grep -qi "error"; then
+                err "withdraw_merchant_funds FAILED: ${WITHDRAW_RESULT}"
+                err "A regression in the merchant withdrawal path would not be"
+                err "caught by the rest of this smoke test — treat as a failure."
+            else
+                ok "withdraw_merchant_funds succeeded."
+
+                # 9i. Assert the merchant's token balance actually increased
+                MERCHANT_BAL_AFTER=$(merchant_vault_balance)
+                MERCHANT_TOKEN_AFTER=$(merchant_token_balance)
+                info "Merchant vault balance after:   ${MERCHANT_BAL_AFTER:-unknown}"
+                info "Merchant token balance after:  ${MERCHANT_TOKEN_AFTER:-unknown}"
+
+                if [ -z "${MERCHANT_TOKEN_BEFORE}" ] || [ -z "${MERCHANT_TOKEN_AFTER}" ]; then
+                    warn "Could not read merchant token balances; withdrawal"
+                    warn "invoked successfully but the balance delta is unverified."
+                elif [ "${MERCHANT_TOKEN_AFTER}" -gt "${MERCHANT_TOKEN_BEFORE}" ] 2>/dev/null; then
+                    ok "Merchant token balance increased: ${MERCHANT_TOKEN_BEFORE} -> ${MERCHANT_TOKEN_AFTER}"
+                else
+                    err "Merchant token balance did NOT increase: ${MERCHANT_TOKEN_BEFORE} -> ${MERCHANT_TOKEN_AFTER}"
+                    err "withdraw_merchant_funds returned success but moved no funds."
+                fi
+
+                if [ "${MERCHANT_BAL_AFTER}" = "0" ] 2>/dev/null; then
+                    ok "Vault merchant balance fully drained."
+                elif [ -n "${MERCHANT_BAL_AFTER}" ] && [ "${MERCHANT_BAL_AFTER}" -lt "${WITHDRAW_AMOUNT}" ] 2>/dev/null; then
+                    warn "Vault merchant balance is lower than before (${MERCHANT_BAL_AFTER} < ${WITHDRAW_AMOUNT})."
+                fi
+            fi
+        fi
+    fi
+
     ok "Smoke test complete."
 }
 
@@ -640,6 +909,8 @@ ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━
   Merchant:     ${MERCHANT_ADDR}
   Network:      ${NETWORK_NAME}
   RPC URL:      ${RPC_URL}
+  Image:        ${QUICKSTART_IMAGE}
+  Protocol:     ${PROTOCOL_VERSION_REPORTED:-unknown} (expected ${EXPECTED_PROTOCOL_VERSION:-derived from soroban-sdk})
 
   State saved:  ${STATE_FILE}
 
@@ -679,6 +950,7 @@ main() {
             --help|-h) usage ;;
             --no-docker) NO_DOCKER=true ;;
             --skip-smoke) SKIP_SMOKE=true ;;
+            --allow-protocol-mismatch) ALLOW_PROTOCOL_MISMATCH=true ;;
             --*) warn "Unknown option: ${arg}" ;;
         esac
     done
@@ -698,6 +970,7 @@ EOF
     check_curl
     if [ "${NO_DOCKER}" = "false" ]; then
         check_docker
+        check_docker_daemon
     else
         info "Skipping Docker check (--no-docker)."
     fi

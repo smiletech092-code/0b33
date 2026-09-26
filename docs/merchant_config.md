@@ -35,6 +35,90 @@ pub struct MerchantConfig {
 }
 ```
 
+## Field mutability
+
+Not all fields can be changed at any time. `fee_bips` and
+`allowed_operations` are **protected**: changing either while the merchant has
+at least one `Active` subscription is rejected with
+`Error::InvalidStatusTransition` (code `4001`) and nothing is written.
+
+| Field | Mutable while `Active` subs exist? | Constraint |
+|-------|-------------------------------------|------------|
+| `payout_address` | ✅ Yes | — |
+| `fee_bips` | ❌ **No — protected** | Requires zero `Active` subscriptions. Must be ≤ `MAX_FEE_BIPS` (10000). |
+| `allowed_operations` | ❌ **No — protected** | Requires zero `Active` subscriptions. Must keep `OP_CHARGE` set. |
+| `is_active` | ✅ Yes | — |
+| `fee_address` | ✅ Yes | — |
+| `redirect_url` | ✅ Yes | — |
+| `is_paused` | ✅ Yes | — |
+| `version` | ❌ Not settable | Schema version; written by migrations, not by `update_merchant_config`. |
+| `last_updated` | ❌ Not settable | Maintained automatically on every successful update. |
+
+### Why those two fields are protected
+
+The protection is about **consent**, not about making the code convenient.
+
+- **`fee_bips`** — a subscription's `amount` is agreed at creation and charged
+  on every interval until the subscriber cancels. Raising `fee_bips` silently
+  re-prices every *already-running* subscription. The subscriber agreed to a
+  rate that no longer exists, and has no on-chain way to notice the change
+  before the next charge lands.
+- **`allowed_operations`** — this permission bitmap also governs the merchant's
+  existing subscriptions. Clearing `OP_WITHDRAW` while subscriptions are live
+  can strand merchant earnings behind subscriptions that can no longer release
+  them. (`OP_CHARGE` was already required to remain set; that narrower rule is
+  unchanged.)
+
+The fields that stay mutable either redirect funds the merchant is *already*
+entitled to (`payout_address`, `fee_address`) or are the levers a merchant
+needs **during** an incident. In particular `is_paused` and `is_active` must
+never be blocked — pausing an active merchant is exactly the action you need
+to be able to take while subscriptions are running.
+
+### Only `Active` counts
+
+The guard counts subscriptions in the `Active` state only. `Paused`,
+`GracePeriod`, `InsufficientBalance`, `Cancelled` and `Expired` do not count.
+
+That is deliberate. `Active` is the only state in which a charge is expected
+to succeed at the next interval, so it is the only state in which a
+retroactive change actually bites a live agreement. It also means a merchant
+whose subscribers need help — everyone in `GracePeriod` waiting on a top-up —
+can still change protected fields, which is exactly when it is safe to do so.
+
+### How to change a protected field
+
+```
+1. Pause the live subscriptions
+   bulk_pause_subscriptions(caller, [id_1, ..., id_N], nonce)
+   (or pause_subscription(id, authorizer) one at a time)
+
+2. Change the protected field
+   update_merchant_config(merchant, None, Some(new_fee_bips), None, None, None, None, None)
+
+3. Resume
+   resume_subscription(id, authorizer)   // per subscription
+   (or bulk resume, depending on your tooling)
+```
+
+`bulk_pause_subscriptions` accepts up to `BATCH_MAX_SIZE` (100) ids per call —
+see [`batch_charge.md`](batch_charge.md#maximum-batch-size) for the batching
+pattern. A merchant with more live subscriptions than one batch needs several
+pause calls before step 2 is accepted.
+
+The rejected call is a **total no-op**: the guard runs before any field is
+written, so a partially-applied update is impossible and `last_updated` is not
+touched. Fix the input and retry — nothing needs unwinding.
+
+### Scan bound
+
+`count_active_subscriptions` walks the merchant's own secondary index
+(`DataKey::MerchantSubs`) and refuses to scan more than
+`MAX_MERCHANT_ACTIVE_SCAN` (5000) entries. If the index is longer than that,
+the count returns `Error::InvalidInput` and the update **fails closed** — an
+oversized index blocks the protected-field change rather than silently
+permitting it.
+
 ## Operation Flags
 
 | Constant | Value | Description |
@@ -108,6 +192,20 @@ pub fn update_merchant_config(
     new_is_paused: Option<bool>,
 ) -> Result<MerchantConfig, Error>
 ```
+
+Enforces the [field mutability](#field-mutability) table above.
+
+Errors:
+
+- `NotFound` — no config record for this merchant
+- `InvalidStatusTransition` (4001) — `new_fee_bips` or `new_allowed_operations`
+  supplied while the merchant has at least one `Active` subscription. Nothing
+  is written.
+- `InvalidFeeBips` — `fee_bips > MAX_FEE_BIPS`
+- `InvalidOperations` — unknown bits in `allowed_operations`
+- `MustAllowChargeOperation` — `OP_CHARGE` cleared
+- `InvalidInput` — the merchant's subscription index exceeds
+  `MAX_MERCHANT_ACTIVE_SCAN` (fails closed)
 
 ### get_merchant_config
 

@@ -76,6 +76,119 @@ Recovery should **NOT** be used for:
 - ❌ Disputes between subscribers and merchants
 - ❌ Regular contract operations or maintenance
 - ❌ "Borrowing" funds temporarily with intent to return
+- ❌ **Funds owed to a cancelled subscriber** — see
+  [Recovery after subscription cancellation](#recovery-after-subscription-cancellation)
+
+---
+
+## Recovery after subscription cancellation
+
+**Rule: `recover_stranded_funds` is *not* a recovery path for a cancelled
+subscription. A cancelled subscription's funds are returned to the subscriber
+through `withdraw_subscriber_funds`, and this entrypoint is structurally
+incapable of taking them.**
+
+This section is normative: the behaviour below is what the implementation does
+today, and integrators and support staff should plan around it rather than
+discovering it at incident time.
+
+### Why there is no status gate
+
+`recover_stranded_funds` does not read a subscription's status. It is not a
+per-subscription entrypoint at all — it takes an `amount` and a `recipient`,
+and has no `subscription_id` parameter. The only balance gate is:
+
+```rust
+recoverable = contract_balance - total_accounted(token)
+if amount > recoverable { return Err(Error::InsufficientBalance); }
+```
+
+`total_accounted` aggregates every subscriber prepaid balance, every merchant
+balance, and every open cancellation escrow. So the exclusion of a cancelled
+subscription's funds is **accounting-based, not status-based**: as long as the
+money is still attributed to someone, it is subtracted out of
+`recoverable` and cannot be recovered, regardless of the subscription's
+lifecycle status.
+
+There is therefore no code path in which "the subscription is `Cancelled`"
+changes the outcome of a recovery attempt.
+
+### Lifecycle of a cancelled subscription's funds
+
+| Stage | Where the funds are | In `total_accounted`? | Recoverable? | Correct action |
+|-------|---------------------|-----------------------|--------------|----------------|
+| 1. `Active` with a prepaid balance | `Subscription.prepaid_balance` | Yes | **No** | Normal billing. |
+| 2. `cancel_subscription` succeeds | Zeroed on the record, moved to `DataKey::CancellationEscrow(subscription_id)` | **Yes** (escrowed, not yet transferred) | **No** | Wait out the dispute window. Nothing to recover. |
+| 3. Escrow window elapsed, subscriber withdraws | Transferred to the subscriber; `sub_total_accounted` decremented | No | n/a — balance left the contract | Done. |
+| 4. Escrow window elapsed, subscriber never withdraws | Still in `CancellationEscrow` | **Yes** | **No** | Subscriber must call `withdraw_subscriber_funds`. Admin cannot. |
+
+Note stage 3: the escrow release decrements `total_accounted` at *withdrawal*
+time, not at cancellation time. So cancelling a subscription does not change
+the recoverable surplus at all — contract balance and accounted move down
+together when the refund is finally paid out. Cancellation never creates
+recoverable funds.
+
+### The one legitimate post-cancellation case: `ExpiredEscrow`
+
+The `ExpiredEscrow` reason (§3 above) is the **only** sanctioned way to touch
+money connected to a cancelled subscription, and it applies to a narrower
+situation than it first appears: funds that are already *unaccounted* because
+the record that accounted for them no longer exists.
+
+Concretely, this is for the case where an escrow (or a subscription balance)
+became permanently unreachable through a bug, a migration, or a state-export /
+state-restore that dropped the accounting entry — the amount is still in the
+contract but `total_accounted` no longer reserves it, so it legitimately shows
+up in `recoverable`.
+
+It is **not** a way to shortcut an escrow that is still properly accounted for.
+Before filing an `ExpiredEscrow` proposal you must show, with on-chain
+evidence, that:
+
+1. The subscription is `Cancelled` and the escrow window has fully elapsed.
+2. The subscriber cannot be reached or has provably abandoned the refund.
+3. **The escrowed amount is not present in `total_accounted`** — i.e. the
+   attempt is not being blocked because someone else is still owed the money.
+4. An open dispute does not exist for that subscription (a dispute blocks
+   withdrawal and must be resolved first).
+
+If step 3 cannot be demonstrated, the correct path is to let the subscriber
+withdraw. Attempting recovery of accounted funds returns
+`Error::InsufficientBalance` and — if forced through a state bug — would be a
+governance violation.
+
+### What an admin sees when they try
+
+| Attempt | Result |
+|---------|--------|
+| Recover the refund of a `Cancelled` subscription whose escrow is still accounted | `Error::InsufficientBalance` (code `1001`) — `amount > recoverable` |
+| Recover the refund of a `Cancelled` subscription after the subscriber already withdrew | `Error::InsufficientBalance` — the funds left the contract entirely |
+| Recover the refund of a `Cancelled` subscription, amount within an unrelated surplus | Succeeds only for the surplus. The escrowed portion is never included in the `amount`. Do not net the two: net recoveries look like theft in the audit trail. |
+| Recover a genuinely orphaned, unaccounted escrow after an upgrade/migration bug | Succeeds with `RecoveryReason::ExpiredEscrow` and the evidence above |
+
+### Support checklist for a cancelled subscription
+
+1. Read the status. `Cancelled` is terminal — there is no `uncancel`
+   entrypoint, so the subscription will never bill again.
+2. Check the escrow. If `CancellationEscrowOpenedEvent` exists for the id and
+   no `CancellationEscrowReleasedEvent` follows it, the refund is still
+   escrowed and **not** admin-recoverable.
+3. Check `now < released_at`. Before the window elapses, withdrawal fails with
+   `Error::EscrowNotReleased`; the wait is enforced on-chain, not administrative.
+4. Check for an open dispute. `withdraw_subscriber_funds` returns
+   `Error::DisputeAlreadyOpen` while a dispute is live; resolve the dispute
+   first.
+5. If the window has elapsed and no dispute is open, the subscriber should call
+   `withdraw_subscriber_funds`. If the subscriber is unreachable, escalate to
+   an `ExpiredEscrow` governance proposal **only** after evidencing that the
+   amount is no longer in `total_accounted`.
+6. Use `get_token_reconciliation` to confirm the numbers before filing any
+   proposal — it reports the contract balance, `total_accounted`, and the
+   recoverable surplus per token, which is the same arithmetic
+   `recover_stranded_funds` gates on. For the operational procedure around
+   reconciling balances, see [`reconciliation_strategy.md`](reconciliation_strategy.md).
+
+---
 
 ## Technical Implementation
 
@@ -436,7 +549,13 @@ Used responsibly with strong governance, recovery can save genuinely stranded fu
 
 - Contract source: `contracts/subscription_vault/src/lib.rs`
 - Test suite: `contracts/subscription_vault/src/test.rs`
+- Cancellation/escrow behaviour: `contracts/subscription_vault/src/subscription.rs`
+  (`apply_cancellation`, `do_withdraw_subscriber_funds`)
+- Accounting gate: `contracts/subscription_vault/src/accounting.rs`
+  (`get_total_accounted`)
 - State machine documentation: `docs/subscription_state_machine.md`
+- Cancellation semantics: `docs/cancellation.md`
+- Reconciling balances: `docs/reconciliation_strategy.md`
 - Admin recovery function: `recover_stranded_funds()`
 - Recovery event type: `RecoveryEvent`
 - Recovery reasons: `RecoveryReason` enum
@@ -444,3 +563,7 @@ Used responsibly with strong governance, recovery can save genuinely stranded fu
 ## Changelog
 
 - 2026-02-21: Initial documentation for admin recovery feature
+- 2026-09-25: Added **Recovery after subscription cancellation** — normative
+  statement that a `Cancelled` subscription's funds are not admin-recoverable,
+  the escrow accounting lifecycle, the `ExpiredEscrow` boundary conditions,
+  observed error codes, and a support checklist (#245).

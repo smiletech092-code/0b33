@@ -72,7 +72,7 @@ Key design properties:
 > **Note on `pause_subscription` / `resume_subscription` / `cancel_subscription`:**
 > These accept an `authorizer: Address` parameter. The caller must be either the
 > subscriber or the merchant of that specific subscription; any other address
-> returns `Error::Unauthorized` (401).
+> returns `Error::Unauthorized` (1001).
 
 ---
 
@@ -103,7 +103,7 @@ Key design properties:
 | `disable_emergency_stop` | `(admin) -> ()` | Admin | Idempotent. Restores normal operations. Emits `EmergencyStopDisabledEvent`. |
 | `get_emergency_stop_status` | `() -> bool` | None | Returns `true` when the circuit breaker is active. |
 
-Blocked operations return `Error::EmergencyStopActive` (1009). Queries,
+Blocked operations return `Error::EmergencyStopActive` (4007). Queries,
 withdrawals, pause/resume/cancel, and export calls are **not** blocked.
 
 ### Subscription Lifecycle
@@ -184,9 +184,9 @@ Codes](#error-codes-failure-modes--retry-behavior)).
 | Entrypoint | Signature | Auth | Notes |
 |-----------|-----------|------|-------|
 | `add_to_blocklist` | `(authorizer, subscriber, reason) -> ()` | Admin (global) or Merchant (own subscribers only) | Prevents new subscriptions and deposits. Existing subscriptions and balances are preserved. |
-| `remove_from_blocklist` | `(admin, subscriber) -> ()` | Admin only | Returns `NotFound` (404) if subscriber is not blocklisted. |
+| `remove_from_blocklist` | `(admin, subscriber) -> ()` | Admin only | Returns `NotFound` (2001) if subscriber is not blocklisted. |
 | `is_blocklisted` | `(subscriber) -> bool` | None | |
-| `get_blocklist_entry` | `(subscriber) -> BlocklistEntry` | None | Returns `NotFound` (404) if not blocklisted. |
+| `get_blocklist_entry` | `(subscriber) -> BlocklistEntry` | None | Returns `NotFound` (2001) if not blocklisted. |
 
 ### Migration / Export
 
@@ -225,7 +225,7 @@ Codes](#error-codes-failure-modes--retry-behavior)).
 | Paused | Cancelled | `cancel_subscription` |
 | InsufficientBalance | Active | `resume_subscription` (requires `prepaid_balance >= amount`) |
 | InsufficientBalance | Cancelled | `cancel_subscription` |
-| Cancelled | — | Terminal; all transition attempts return `InvalidStatusTransition` (400) |
+| Cancelled | — | Terminal; all transition attempts return `InvalidStatusTransition` (4001) |
 | *any* | Same | Idempotent; always allowed |
 
 > **Important:** `deposit_funds` does **not** change status. After topping up
@@ -276,24 +276,25 @@ Pre-conditions:
      status IN (Active, GracePeriod)
      AND now >= last_payment_timestamp + interval_seconds
 
-2. Billing engine → batch_charge([id_1, id_2, ..., id_N])
-     N ≤ ~50–100 (network-dependent gas limit)
+2. Billing engine → batch_charge([id_1, id_2, ..., id_N], nonce)
+     N ≤ 100 (hard cap, BATCH_MAX_SIZE); target ~50 per call.
+     >100 is rejected wholesale with InvalidInput (3002) before any charge.
    → returns Vec<BatchChargeResult>
 
 3. For each result:
-   success=true  → update DB: prepaid_balance, last_payment_timestamp, status
-   error_code=1101 (IntervalNotElapsed)  → safe to skip; clock skew or early retry
-   error_code=1102 (Replay)              → already charged this period; remove from queue
-   error_code=1001 (InsufficientBalance) → notify subscriber; watch for RecoveryReadyEvent
-   error_code=1103 (NotActive)           → subscription paused or cancelled; suspend billing
-   error_code=404  (NotFound)            → remove from billing queue
+   success=true              → update DB: prepaid_balance, last_payment_timestamp, status
+   error_code=4004 (IntervalNotElapsed)  → safe to skip; clock skew or early retry
+   error_code=4005 (Replay)              → already charged this period; remove from queue
+   error_code=5001 (InsufficientBalance) → notify subscriber; watch for RecoveryReadyEvent
+   error_code=4002 (NotActive)           → subscription paused or cancelled; suspend billing
+   error_code=2001 (NotFound)            → remove from billing queue
 ```
 
 ### 3. Recovery from Insufficient Balance
 
 ```
 Admin: batch_charge([sub_id])
-  → BatchChargeResult { success: false, error_code: 1001 }
+  → BatchChargeResult { success: false, error_code: 5001 }
   → contract emits SubscriptionChargeFailedEvent
   → status transitions to GracePeriod or InsufficientBalance
 
@@ -347,7 +348,7 @@ Subscriber → deposit_funds(sub_id, subscriber, deposit_amount)
 // Billing engine submits metered debit
 Admin → charge_usage_with_reference(sub_id, usage_amount, reference_string)
         — reference_string must be unique per subscription (e.g. "2026-03-usage-batch-001")
-        → replay protection: duplicate reference returns Error::Replay (1102)
+        → replay protection: duplicate reference returns Error::Replay (4005)
         → on success: prepaid_balance reduced; UsageStatementEvent emitted
         → if balance hits 0: status → InsufficientBalance
 
@@ -489,45 +490,53 @@ for event in contract_events {
 
 ## Error Codes, Failure Modes & Retry Behavior
 
-### Complete Error Code Table
+### Error Codes Relevant to Billing Retries
 
-| Code | Variant | Category | Meaning | Retry? |
-|------|---------|----------|---------|--------|
-| 400 | `InvalidStatusTransition` | State | Requested transition not allowed (e.g. Cancelled → Active). | No |
-| 401 | `Unauthorized` | Auth | Caller is not admin or not the subscriber/merchant for this subscription. | No (fix signing key) |
-| 402 | `BelowMinimumTopup` | Input | Deposit amount below `min_topup`. | No (increase amount) |
-| 403 | `Forbidden` | Auth | Authorized caller lacks permission for this specific action (e.g. merchant blocklisting unrelated subscriber). | No |
-| 404 | `NotFound` | Input | Subscription ID or resource not found. | No (verify ID) |
-| 405 | `InvalidAmount` | Input | Amount is zero or negative. | No |
-| 406 | `InvalidRecoveryAmount` | Input | Recovery amount is zero or negative. | No |
-| 407 | `UsageNotEnabled` | Input | `charge_usage` on a subscription without `usage_enabled`. | No |
-| 408 | `InvalidInput` | Input | Invalid parameters (e.g. `limit=0` on export). | No |
-| 1001 | `InsufficientBalance` | Funds | Interval charge failed; balance too low. Status → GracePeriod or InsufficientBalance. | After top-up + resume |
-| 1002 | `InsufficientPrepaidBalance` | Funds | Usage charge exceeds balance. | After top-up |
-| 1003 | `NotActive` | Lifecycle | Charge on Paused or Cancelled subscription. | After resume |
-| 1004 | `UsageNotEnabled` | Input | (same as 407 in usage context) | No |
-| 1005 | `InsufficientPrepaidBalance` | Funds | (same as 1002 in charge_usage context) | After top-up |
-| 1009 | `EmergencyStopActive` | System | Operation blocked by circuit breaker. | After stop disabled |
-| 1101 | `IntervalNotElapsed` | Timing | Charge attempted before interval elapsed. | Yes — wait until due |
-| 1102 | `Replay` | Timing | Charge already processed this period (replay protection). | No (already charged) |
-| 1103 | `NotActive` | Lifecycle | (alias used in `BatchChargeResult` for not-active items) | After resume |
-| 1201 | `Overflow` | Math | Arithmetic overflow. | No (check amounts) |
-| 1202 | `Underflow` | Math | Arithmetic underflow. | No (check balances) |
-| 1301 | `AlreadyInitialized` | Config | Contract already initialized. | No |
-| 1302 | `NotInitialized` | Config | Contract not yet initialized. | No (call `init` first) |
+> **The canonical error-code table is [`errors.md`](errors.md).** It is
+> generated directly from the `Error` enum in `types.rs` by
+> `scripts/generate_error_table.py` and is validated in CI, so it is always in
+> sync with the contract. The subset below covers only the codes a billing
+> engine must classify on, and the codes are the authoritative ones from that
+> table.
+
+| Code | Variant | Meaning | Retry? |
+|------|---------|---------|--------|
+| 1001 | `Unauthorized` | Caller is not the admin / not the subscriber or merchant for this subscription. | No — fix the signing key |
+| 1002 | `Forbidden` | Authorized caller lacks permission for this specific action. | No |
+| 1005 | `NonceAlreadyUsed` | Batch/admin nonce already consumed for this domain. | Fetch a fresh nonce, then retry |
+| 2001 | `NotFound` | Subscription id or resource does not exist. | No — drop from the queue |
+| 3001 | `InvalidAmount` | Amount is zero or negative. | No |
+| 3002 | `InvalidInput` | Malformed input: oversized batch (> `BATCH_MAX_SIZE`), duplicate ids in a batch, bad interval, bad pagination limit. | No as-is — fix the input, then retry |
+| 4001 | `InvalidStatusTransition` | Requested transition not allowed (e.g. `Cancelled` → `Active`). | No |
+| 4002 | `NotActive` | Charge attempted on a Paused / Cancelled / Expired subscription. | After `SubscriptionResumedEvent` |
+| 4004 | `IntervalNotElapsed` | Charge attempted before `last_payment_timestamp + interval_seconds`. | Yes — wait until due |
+| 4005 | `Replay` | Charge already processed for this period (replay protection). | No — already charged |
+| 4007 | `EmergencyStopActive` | Operation blocked by the circuit breaker. | After the stop is lifted |
+| 5001 | `InsufficientBalance` | Interval charge failed for lack of prepaid funds. Status → `GracePeriod` or `InsufficientBalance`. | After top-up + resume |
+| 10005 | `DisputeAlreadyOpen` | A dispute blocks the operation. | No — resolve the dispute |
+| 13005 | `EscrowNotReleased` | Cancellation escrow window has not elapsed. | After `released_at` |
+
+Codes outside this list exist — consult [`errors.md`](errors.md) for the full
+set, its numeric code, and the files that emit it.
 
 ### Retry Behavior for the Billing Engine
 
+Codes below are the authoritative values from [`errors.md`](errors.md).
+
 **Safe to retry unconditionally:**
-- `IntervalNotElapsed` (1101): The original transaction may have timed out before inclusion. If it did succeed, a retry returns 1101 — no double-charge possible because the contract checks `period_index`. Always safe to retry.
-- `Replay` (1102): Already charged; remove from queue.
+- `IntervalNotElapsed` (4004): The original transaction may have timed out before inclusion. If it did succeed, a retry returns 4004 — no double-charge possible because the contract checks `period_index`. Always safe to retry.
+
+**Already satisfied — drop from the queue:**
+- `Replay` (4005): Already charged for this period; do not re-queue.
+- `NotFound` (2001): The id no longer exists.
 
 **Retry after state change:**
-- `InsufficientBalance` (1001): Keep in queue. Wait for `RecoveryReadyEvent` or `SubscriptionResumedEvent` before retrying.
-- `NotActive` (1003/1103): Wait for `SubscriptionResumedEvent`.
+- `InsufficientBalance` (5001): Keep in queue. Wait for `RecoveryReadyEvent` or `SubscriptionResumedEvent` before retrying.
+- `NotActive` (4002): Wait for `SubscriptionResumedEvent`.
 
 **Do not retry:**
-- `Unauthorized` (401), `NotFound` (404), `Forbidden` (403), `EmergencyStopActive` (1009), `InvalidStatusTransition` (400): Indicate a structural issue. Fix the root cause first.
+- `Unauthorized` (1001), `Forbidden` (1002), `InvalidStatusTransition` (4001), `InvalidInput` (3002): Indicate a structural issue. Fix the root cause first.
+- `EmergencyStopActive` (4007): No items were charged. Retry only after the stop is lifted — see [`emergency_stop.md`](emergency_stop.md).
 
 ### Batch Charge Partial Failures
 
@@ -539,15 +548,141 @@ result[i].success == true   → item charged successfully
 result[i].success == false  → item failed; result[i].error_code indicates why
 ```
 
-Parse every result. A single `Unauthorized` (401) at the batch level means
+Parse every result. A single `Unauthorized` (1001) at the batch level means
 **no items** were attempted (the admin auth check precedes the loop).
+
+> Batch length is capped at `BATCH_MAX_SIZE` = 100 ids. An oversized batch is
+> rejected wholesale with `Error::InvalidInput` (3002) before any id is
+> processed and without consuming the nonce — see
+> [`batch_charge.md` → Maximum batch size](batch_charge.md#maximum-batch-size).
+
+#### Retry guidance for partial failures
+
+This is the part integrators most often get wrong, and both failure modes are
+real:
+
+- **Over-retrying** re-sends ids that already succeeded. The contract will not
+  double-charge them (the interval guard returns `IntervalNotElapsed`), but you
+  burn nonces, spam the ledger, and pollute your own success metrics.
+- **Under-retrying** drops ids whose failure was transient. A subscriber whose
+  top-up landed a second later never gets billed, and the miss is silent.
+
+The rule that avoids both: **retry only the ids that failed, and only after
+their blocking condition has cleared.** Never replay a whole batch because part
+of it failed.
+
+##### The two retry windows
+
+`batch_charge` has two distinct rejection points, and they have different nonce
+semantics. Getting these backwards is the most common cause of a stuck billing
+loop.
+
+| Rejection | Detected as | Nonce | Recovery |
+|-----------|-------------|-------|----------|
+| **Input rejected** — batch > 100 ids, or duplicate ids. No id was processed. | Outer `Err(InvalidInput)` (3002) | **Not consumed** | Reuse the same nonce. Split the batch, drop duplicates. |
+| **Batch ran** — every id was attempted, some failed individually. | Outer `Ok(vec)` with `success = false` entries | **Consumed** | Must use a **fresh** nonce. Retry only the failed ids. |
+
+##### Pseudo-code
+
+```text
+function run_billing_batch(ids, nonce):
+    results = batch_charge(ids, nonce)
+
+    # ── Outer error: the batch never ran ──────────────────────────────
+    # Nothing was charged. The nonce is still unused, so retrying with the
+    # SAME nonce is safe and is the recommended recovery.
+    if results is Err(InvalidInput):
+        if len(ids) > BATCH_MAX_SIZE:
+            # Split into chunks of <= 50 and run each as its own call.
+            for chunk in chunks(ids, 50):
+                run_billing_batch(chunk, nonce)   # nonce advances per successful call
+        else:
+            # Duplicate ids in the batch — dedupe, then retry with same nonce.
+            run_billing_batch(unique(ids), nonce)
+        return
+
+    if results is Err(NonceAlreadyUsed):
+        # Another admin call already consumed this nonce. Fetch a new one.
+        # Do NOT assume the previous run did nothing.
+        return run_billing_batch(ids, fresh_nonce())
+
+    if results is Err(EmergencyStopActive):
+        # No items charged. Stop the billing loop and alert; retry only after
+        # the stop is lifted. See docs/emergency_stop.md.
+        return
+
+    if results is Err(Unauthorized):
+        # No items charged. Fix credentials before any retry.
+        return
+
+    # ── Outer Ok: the batch ran. Partition on per-item results. ────────
+    succeeded = []
+    failed    = []
+
+    for i, r in enumerate(results):
+        # results[i] corresponds to ids[i] — order is guaranteed.
+        if r.success:
+            succeeded.append(ids[i])
+            mark_charged(ids[i])          # persist locally
+        else:
+            failed.append((ids[i], r.error_code))
+
+    if failed is empty:
+        return
+
+    # ── Classify each failure. A FRESH nonce is required for the retry. ──
+    retryable   = []
+    wait_for_event = []
+    drop = []
+
+    for (id, code) in failed:
+        switch code:
+            case IntervalNotElapsed:  drop.append(id)        # already billed this period
+            case Replay:              drop.append(id)        # duplicate of an earlier charge
+            case NotFound:            drop.append(id)        # gone; stop tracking
+            case NotActive:           wait_for_event.append(id)   # paused/cancelled
+            case InsufficientBalance: wait_for_event.append(id)   # awaiting top-up
+            default:                  drop.append(id)        # structural; investigate
+
+    if retryable is not empty:
+        # NOTE: fresh nonce — the previous batch consumed its own.
+        run_billing_batch(retryable, fresh_nonce())
+
+    for id in wait_for_event:
+        # Re-queue on the event, not on a timer. Do not tight-loop: a short
+        # interval plus a tight retry loop produces IntervalNotElapsed churn.
+        watch_events(id, [RecoveryReadyEvent, SubscriptionResumedEvent],
+                     FundsDepositedEvent)
+```
+
+##### Rules of thumb
+
+1. **Fresh nonce per executed batch.** A nonce is consumed the moment a batch
+   runs, whether or not any item succeeded. Reusing it yields `Replay` (4005).
+2. **Idempotency comes from the contract, not from your queue.** The
+   `period_index` / `last_payment_timestamp` guard means a duplicate attempt
+   can never double-charge. Design your retry so it is *cheap and quiet*, not so
+   it is *safe* — safety is already guaranteed, over-retrying just wastes
+   ledger space and nonces.
+3. **Re-queue on events, not on timers.** `InsufficientBalance` and `NotActive`
+   clear when the subscriber tops up or resumes. Polling burns nonces and
+   produces `IntervalNotElapsed` noise that masks real failures.
+4. **Persist `success = true` ids before building the next batch.** A crash
+   between the chain call and your bookkeeping is the one case where a
+   genuinely-safe retry becomes a real double-charge risk in *your* ledgers.
+5. **Cap the batch at 50, not 100.** See
+   [`batch_charge.md` → Sizing guidance](batch_charge.md#sizing-guidance).
+
+For the contract-side mechanics — `period_index`, nonce domains, and why
+`charge_usage_with_reference` behaves differently — see
+[`replay_protection.md`](replay_protection.md).
 
 ### Usage Charge Replay Protection
 
 `charge_usage_with_reference` rejects duplicate `reference` strings per
-subscription with `Error::Replay` (1102). Design reference strings to be:
+subscription with `Error::Replay` (4005). Design reference strings to be:
 - Globally unique per subscription per period (e.g. `"{sub_id}-{epoch_day}"`).
-- Idempotent: the same reference from a retried network call is safe and returns 1102 rather than double-charging.
+- Idempotent: the same reference from a retried network call is safe and returns 4005 rather than double-charging.
 
 ---
 

@@ -161,28 +161,63 @@ pub fn get_plan_template(
 
 ## Behavior and Guarantees
 
-### Template Immutability
+### Template Immutability and Versioning
 
-Once created, plan templates are immutable. This ensures that:
+The current implementation treats plan templates as **immutable**. Once created, plan templates cannot be updated. This design ensures:
+
 - Existing subscriptions are not affected by template changes
 - Subscribers know exactly what they're getting when they subscribe
 - Historical records remain accurate
 
-If you need to change a plan, create a new template with updated parameters.
+**If you need to change a plan**, create a new template with updated parameters and update your frontend/integration to point to the new template ID.
 
-### Subscription Independence
+### Subscription Pinning to Template Version
 
-Subscriptions created from templates are fully independent:
-- Each subscription has its own state and lifecycle
-- Pausing, canceling, or modifying one subscription does not affect others
-- Each subscription maintains its own balance and payment history
+When a subscription is created from a template using `create_subscription_from_plan()`, the subscription captures the template's parameters at creation time:
 
-### ID Management
+```
+create_subscription_from_plan(subscriber, plan_template_id) 
+  → Reads plan_template_id from storage
+  → Extracts amount, interval_seconds, usage_enabled, merchant
+  → Creates subscription with those exact parameters
+  → Subscription is independent of the template thereafter
+```
 
-Plan template IDs and subscription IDs are managed independently:
-- Plan templates use a separate ID counter (`next_plan_id`)
-- Subscriptions use their own ID counter (`next_id`)
-- This prevents ID collisions and allows for clear separation of concerns
+**Key behavior:** The subscription is **not** a reference to the template; it's a fully independent subscription with its own state. Once created:
+
+- Changes to the template have **no effect** on the subscription (templates are immutable anyway)
+- Subscriptions created before and after a template update have identical billing terms
+- Each subscription maintains its own lifecycle independently
+
+### Future Template Versioning (Not Yet Implemented)
+
+If template updates are enabled in a future release, subscriptions would be pinned to the template version at creation time:
+
+```
+Scenario: Admin updates template from $9.99/month to $12.99/month
+
+Subscriptions created BEFORE update:
+  - Remain at $9.99/month (pinned to original version)
+  - Continue billing at original rate indefinitely
+
+Subscriptions created AFTER update:
+  - Use new $12.99/month rate
+  - Are independent subscription instances
+```
+
+The contract would track:
+
+```rust
+pub struct Subscription {
+    // ... existing fields ...
+    plan_template_id: Option<u32>,        // Which template was used
+    template_version: u32,                // Version at creation time
+    amount: i128,                         // Pinned amount (immutable)
+    interval_seconds: u64,                // Pinned interval (immutable)
+}
+```
+
+This ensures backwards compatibility: subscriptions are always pinned to their creation-time terms, even if the template evolves.
 
 ## Compatibility
 

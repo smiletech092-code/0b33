@@ -80,7 +80,7 @@ fn test_multi_actor_e2e_flow() {
 
     // Step 2: `deposit` funds
     let deposit_amount = 15_000_000; // Covers 3 intervals
-    vault.deposit_funds(&sub_id, &subscriber, &deposit_amount, &None);
+    vault.deposit_funds(&sub_id, &deposit_amount, &None);
 
     assert_eq!(token.balance(&subscriber), initial_mint - deposit_amount);
     assert_eq!(token.balance(&vault_id), deposit_amount);
@@ -149,4 +149,109 @@ fn test_multi_actor_e2e_flow() {
         token.balance(&vault_id),
         vault.get_merchant_balance(&merchant)
     );
+}
+
+#[test]
+fn test_batch_charge_withdraw_between_batches_keeps_merchant_ledger_consistent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let (token, token_admin_client) = create_token_contract(&env, &token_admin);
+
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let subscriber_a = Address::generate(&env);
+    let subscriber_b = Address::generate(&env);
+    let subscriber_c = Address::generate(&env);
+
+    token_admin_client.mint(&subscriber_a, &100_000_000);
+    token_admin_client.mint(&subscriber_b, &100_000_000);
+    token_admin_client.mint(&subscriber_c, &100_000_000);
+
+    let vault_id = env.register(SubscriptionVault, ());
+    let vault = SubscriptionVaultClient::new(&env, &vault_id);
+
+    let min_topup = 1_000_000;
+    let grace_period = 3 * 24 * 60 * 60;
+    vault.init(&token.address, &7, &admin, &min_topup, &grace_period);
+
+    let redirect_url = soroban_sdk::String::from_str(&env, "https://example.com");
+    vault.initialize_merchant_config(&merchant, &merchant, &0, &0x1F, &None, &redirect_url);
+
+    let amount = 5_000_000;
+    let interval_seconds = 30 * 24 * 60 * 60;
+    let deposit_amount = 30_000_000;
+
+    let sub_a = vault.create_subscription(
+        &subscriber_a,
+        &merchant,
+        &amount,
+        &interval_seconds,
+        &false,
+        &None,
+        &None::<u64>,
+        &None::<Address>,
+    );
+    let sub_b = vault.create_subscription(
+        &subscriber_b,
+        &merchant,
+        &amount,
+        &interval_seconds,
+        &false,
+        &None,
+        &None::<u64>,
+        &None::<Address>,
+    );
+
+    vault.deposit_funds(&sub_a, &subscriber_a, &deposit_amount, &None);
+    vault.deposit_funds(&sub_b, &subscriber_b, &deposit_amount, &None);
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + interval_seconds + 1);
+
+    let batch_one = soroban_sdk::Vec::from_array(&env, [sub_a, sub_b]);
+    let results_one = vault.batch_charge(&batch_one, &0u64);
+    assert_eq!(results_one.len(), 2);
+    assert!(results_one.get(0).unwrap().success);
+    assert!(results_one.get(1).unwrap().success);
+
+    let earnings_after_first_batch = vault.get_merchant_token_earnings(&merchant, &token.address);
+    assert_eq!(earnings_after_first_batch.accruals.interval, 2 * amount);
+    assert_eq!(earnings_after_first_batch.withdrawals, 0);
+    assert_eq!(earnings_after_first_batch.refunds, 0);
+    assert_eq!(vault.get_merchant_balance(&merchant), 2 * amount);
+
+    let withdrawal_amount = amount;
+    vault.withdraw_merchant_funds(&merchant, &withdrawal_amount);
+
+    let earnings_after_withdraw = vault.get_merchant_token_earnings(&merchant, &token.address);
+    assert_eq!(earnings_after_withdraw.accruals.interval, 2 * amount);
+    assert_eq!(earnings_after_withdraw.withdrawals, withdrawal_amount);
+    assert_eq!(vault.get_merchant_balance(&merchant), 2 * amount - withdrawal_amount);
+
+    let sub_c = vault.create_subscription(
+        &subscriber_c,
+        &merchant,
+        &amount,
+        &interval_seconds,
+        &false,
+        &None,
+        &None::<u64>,
+        &None::<Address>,
+    );
+    vault.deposit_funds(&sub_c, &subscriber_c, &deposit_amount, &None);
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + interval_seconds + 1);
+
+    let batch_two = soroban_sdk::Vec::from_array(&env, [sub_c]);
+    let results_two = vault.batch_charge(&batch_two, &0u64);
+    assert_eq!(results_two.len(), 1);
+    assert!(results_two.get(0).unwrap().success);
+
+    let earnings_after_second_batch = vault.get_merchant_token_earnings(&merchant, &token.address);
+    assert_eq!(earnings_after_second_batch.accruals.interval, 3 * amount);
+    assert_eq!(earnings_after_second_batch.withdrawals, withdrawal_amount);
+    assert_eq!(vault.get_merchant_balance(&merchant), 2 * amount);
 }

@@ -58,9 +58,9 @@ enum SubscriptionKey {
     SubscriberCreateWindow = 61,
     ChargeSalt = 64,
     SubCoupon = 68,
-    SubscriberActiveCount = 70,
-    SubscriberActiveCapOverride = 71,
-    CancellationEscrow = 75,
+    SubscriberActiveCount = 71,
+    SubscriberActiveCapOverride = 72,
+    CancellationEscrow = 76,
 }
 
 impl SubscriptionKey {
@@ -129,10 +129,10 @@ enum MerchantKey {
     MerchantBalance = 33,
     MerchantMaxSubs = 45,
     PayoutSchedule = 53,
-    MerchantMultiSig = 69,
-    TagAllowlist = 72,
-    MerchantTags = 73,
-    MerchantFeeBps = 76,
+    MerchantMultiSig = 70,
+    TagAllowlist = 73,
+    MerchantTags = 74,
+    MerchantFeeBps = 77,
 }
 
 impl MerchantKey {
@@ -170,6 +170,66 @@ impl MerchantKey {
             Self::TagAllowlist => DataKey::TagAllowlist,
             Self::MerchantTags => DataKey::MerchantTags(address),
             Self::MerchantFeeBps => DataKey::MerchantFeeBps(address),
+        }
+    }
+}
+
+/// Coupon-domain storage keys: coupon records, global redemption counters, and
+/// per-subscription bindings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+enum CouponKey {
+    Coupon = 56,
+    CouponRedemptions = 57,
+    SubCouponRedeemed = 69,
+}
+
+impl CouponKey {
+    const ALL: [Self; 3] = [Self::Coupon, Self::CouponRedemptions, Self::SubCouponRedeemed];
+
+    const fn claimed_discriminant(self) -> u32 {
+        self as u32
+    }
+
+    fn representative_data_key(self, env: &Env) -> DataKey {
+        let code = soroban_sdk::Symbol::new(env, "TEST");
+        match self {
+            Self::Coupon => DataKey::Coupon(code),
+            Self::CouponRedemptions => DataKey::CouponRedemptions(code.clone()),
+            Self::SubCouponRedeemed => DataKey::SubCouponRedeemed(1, code),
+        }
+    }
+}
+
+/// Dispute-domain storage keys: dispute records, escrow ledgers, the dispute ID
+/// counter, and the per-subscription active-dispute index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+enum DisputeKey {
+    DisputeEscrow = 49,
+    Dispute = 50,
+    NextDisputeId = 51,
+    SubscriptionDispute = 52,
+}
+
+impl DisputeKey {
+    const ALL: [Self; 4] = [
+        Self::DisputeEscrow,
+        Self::Dispute,
+        Self::NextDisputeId,
+        Self::SubscriptionDispute,
+    ];
+
+    const fn claimed_discriminant(self) -> u32 {
+        self as u32
+    }
+
+    fn representative_data_key(self, _env: &Env) -> DataKey {
+        match self {
+            Self::DisputeEscrow => DataKey::DisputeEscrow(1),
+            Self::Dispute => DataKey::Dispute(1),
+            Self::NextDisputeId => DataKey::NextDisputeId,
+            Self::SubscriptionDispute => DataKey::SubscriptionDispute(1),
         }
     }
 }
@@ -230,9 +290,9 @@ impl GovernanceKey {
 /// This is the cross-version snapshot: it is written out longhand so that a
 /// future edit to any group is visible as an explicit change to a frozen list
 /// rather than an invisible renumbering.
-const GROUPED_DISCRIMINANT_SNAPSHOT: [u32; 40] = [
+const GROUPED_DISCRIMINANT_SNAPSHOT: [u32; 47] = [
     0, 2, 5, 6, 7, 8, 9, 10, 16, 17, 18, 19, 20, 22, 23, 28, 30, 32, 33, 34, 39, 40, 41, 45, 46,
-    47, 48, 53, 54, 60, 61, 64, 68, 69, 70, 71, 72, 73, 75, 76,
+    47, 48, 49, 50, 51, 52, 53, 54, 56, 57, 60, 61, 64, 68, 69, 70, 71, 72, 73, 74, 76, 77,
 ];
 
 fn all_grouped_discriminants() -> Vec<u32> {
@@ -245,6 +305,8 @@ fn all_grouped_discriminants() -> Vec<u32> {
                 .iter()
                 .map(|key| key.claimed_discriminant()),
         )
+        .chain(CouponKey::ALL.iter().map(|key| key.claimed_discriminant()))
+        .chain(DisputeKey::ALL.iter().map(|key| key.claimed_discriminant()))
         .collect();
     discriminants.sort_unstable();
     discriminants
@@ -293,6 +355,34 @@ fn governance_group_agrees_with_canonical_registry() {
 }
 
 #[test]
+fn coupon_group_agrees_with_canonical_registry() {
+    let env = Env::default();
+
+    for key in CouponKey::ALL {
+        let data_key = key.representative_data_key(&env);
+        assert_eq!(
+            data_key.canonical_discriminant(),
+            key.claimed_discriminant(),
+            "coupon group is stale for {key:?}"
+        );
+    }
+}
+
+#[test]
+fn dispute_group_agrees_with_canonical_registry() {
+    let env = Env::default();
+
+    for key in DisputeKey::ALL {
+        let data_key = key.representative_data_key(&env);
+        assert_eq!(
+            data_key.canonical_discriminant(),
+            key.claimed_discriminant(),
+            "dispute group is stale for {key:?}"
+        );
+    }
+}
+
+#[test]
 fn groups_are_pairwise_disjoint() {
     let discriminants = all_grouped_discriminants();
 
@@ -328,7 +418,7 @@ fn merchant_group_keys_are_all_instance_tier() {
 fn per_subscription_record_keys_stay_off_the_instance_allowlist() {
     // These are persistent-tier by design; if one appears in the instance
     // allowlist, a storage tier changed under us.
-    for discriminant in [6u32, 7, 8, 39, 40, 68, 75] {
+    for discriminant in [6u32, 7, 8, 39, 40, 68, 76] {
         assert!(
             !is_known_instance_discriminant(discriminant),
             "discriminant {discriminant} unexpectedly became an instance key"

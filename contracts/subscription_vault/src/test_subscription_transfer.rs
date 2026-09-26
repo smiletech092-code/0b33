@@ -42,7 +42,7 @@ fn test_happy_path_transfer() {
         &None,
     );
 
-    client.deposit_funds(&sub_id, &sub1, &50_000, &None);
+    client.deposit_funds(&sub_id, &50_000, &None);
 
     let expires_at = env.ledger().timestamp() + 3600;
     client.initiate_transfer(&sub_id, &sub1, &sub2, &expires_at);

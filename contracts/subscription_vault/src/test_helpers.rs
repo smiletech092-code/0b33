@@ -43,12 +43,8 @@ pub fn run_all_mutation_calls(
     results.push(client.try_create_subscription_from_plan(subscriber, sub_id).map(|_| ( )));
 
     // try_deposit_funds
-    results.push(client.try_deposit_funds(
-        sub_id,
-        subscriber,
-        &1_000_000i128,
-        &None::<soroban_sdk::BytesN<32>>,
-    ).map(|_| ( )));
+    results.push(client.try_deposit_funds(sub_id, &1_000_000i128,
+        &None::<soroban_sdk::BytesN<32>>,).map(|_| ( )));
 
     // try_charge_subscription
     results.push(client.try_charge_subscription(sub_id, &None::<soroban_sdk::BytesN<32>>).map(|_| ( )));

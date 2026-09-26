@@ -1,0 +1,178 @@
+name: Benchmark Regression
+
+# Run on every push to main (stores a new baseline) and on every PR targeting
+# main (compares against the baseline from the most-recent main run).
+#
+# Artifact retention: 90 days.  The comparison job downloads the most-recent
+# artifact named `bench-results-main` that was uploaded by a successful run on
+# the main branch.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Regression threshold: a benchmark must not regress by more than this
+  # percentage before the comparison job fails.  Matches the value documented
+  # in docs/benchmarks/methodology.md §4.
+  REGRESSION_THRESHOLD: "20.0"
+
+jobs:
+  # ── Job 1: run all benchmark harnesses and upload results ─────────────────
+  run-benchmarks:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4.2.2
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+            ${{ runner.os }}-cargo-
+
+      # Run every bench file in contracts/subscription_vault/benches/.
+      # --nocapture is required so the [bench_*] tagged lines reach stdout.
+      - name: Run bench harnesses
+        run: |
+          cargo test -p subscription_vault \
+            --test batch_charge_100_500 \
+            --test batch_charge_scaling \
+            --test charge_cold_warm \
+            --test withdraw_fixed_cost \
+            --test dispute_lifecycle \
+            --test gov_tally \
+            --test idem_lookup \
+            -- --nocapture 2>&1 | tee bench_raw_output.txt
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.0.0
+        with:
+          python-version: "3.12"
+
+      # Parse the raw output and produce a structured JSON file.
+      - name: Extract benchmark metrics
+        run: |
+          python scripts/bench_extract.py \
+            --input bench_raw_output.txt \
+            --commit "${{ github.sha }}" \
+            > bench_results.json
+          echo "=== Extracted metrics ==="
+          cat bench_results.json
+
+      # Always upload the raw log so it can be reviewed even when the
+      # comparison job fails.
+      - name: Upload raw bench output
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: bench-raw-output-${{ github.sha }}
+          path: bench_raw_output.txt
+          retention-days: 30
+
+      # Upload the structured results.  On main branches the artifact is also
+      # uploaded under the stable name `bench-results-main` so comparison jobs
+      # on PRs can find it without knowing the exact commit SHA.
+      - name: Upload bench results (per-commit)
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: bench-results-${{ github.sha }}
+          path: bench_results.json
+          retention-days: 90
+
+      - name: Upload bench results (main baseline)
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: bench-results-main
+          path: bench_results.json
+          retention-days: 90
+
+  # ── Job 2: compare against the main baseline (PRs only) ───────────────────
+  compare-benchmarks:
+    name: Compare against baseline
+    runs-on: ubuntu-latest
+    needs: run-benchmarks
+    # Only run on PRs — the main branch run *is* the new baseline.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      # Download the current PR's results produced by the job above.
+      - name: Download current results
+        uses: actions/download-artifact@v4.2.1
+        with:
+          name: bench-results-${{ github.sha }}
+          path: current
+
+      # Download the most-recent baseline from the main branch.
+      # If no baseline exists yet (first ever run) the step fails gracefully
+      # and the comparison is skipped via continue-on-error.
+      - name: Download main baseline
+        id: download-baseline
+        continue-on-error: true
+        uses: actions/download-artifact@v4.2.1
+        with:
+          name: bench-results-main
+          path: baseline
+          # Search across all workflow runs on this repository, not just the
+          # current workflow run, so the most-recent main artifact is found.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.0.0
+        with:
+          python-version: "3.12"
+
+      # If no baseline was found, print a notice and exit cleanly.
+      - name: Check baseline availability
+        id: baseline-check
+        run: |
+          if [ -f baseline/bench_results.json ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No main baseline found — skipping regression comparison."
+            echo "This is expected on the first run after the workflow is added."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compare results
+        if: steps.baseline-check.outputs.available == 'true'
+        run: |
+          python scripts/bench_compare.py \
+            --baseline baseline/bench_results.json \
+            --current  current/bench_results.json  \
+            --threshold "${{ env.REGRESSION_THRESHOLD }}"
+
+      # Attach both JSON files to the workflow summary for easy inspection.
+      - name: Add results to job summary
+        if: always() && steps.baseline-check.outputs.available == 'true'
+        run: |
+          echo "## Benchmark Regression Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Threshold: **${{ env.REGRESSION_THRESHOLD }}%**" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Current results" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat current/bench_results.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Baseline (main)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat baseline/bench_results.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

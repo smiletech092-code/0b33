@@ -17,6 +17,12 @@ cast_sign_loss = "warn"
 [features]
 default = ["oracle-pricing"]
 oracle-pricing = []
+# Enable this feature when building with `cargo kani` so that the pure-Rust
+# verification harnesses in `verification/` are included in the compilation
+# unit.  The feature gates `pub use subscription::next_charge_time` (and any
+# other internal symbols the harnesses need) without exposing them in normal
+# builds or the WASM ABI.
+kani_harness = []
 
 [dependencies]
 soroban-sdk = "22.0.0"

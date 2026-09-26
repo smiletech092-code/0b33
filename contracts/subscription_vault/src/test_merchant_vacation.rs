@@ -80,7 +80,7 @@ fn setup_merchant_and_sub(
     );
 
     token_admin.mint(&subscriber, &10_000i128);
-    client.deposit_funds(&sub_id, &subscriber, &1_000i128, &None);
+    client.deposit_funds(&sub_id, &1_000i128, &None);
 
     (sub_id, merchant, subscriber)
 }
@@ -314,7 +314,7 @@ fn test_vacation_does_not_affect_other_merchants() {
     );
 
     token_admin.mint(&subscriber2, &10_000i128);
-    client.deposit_funds(&sub_id2, &subscriber2, &1_000i128, &None);
+    client.deposit_funds(&sub_id2, &1_000i128, &None);
 
     let now = env.ledger().timestamp();
 
@@ -364,7 +364,7 @@ fn test_vacation_usage_charge_blocked() {
     );
 
     token_admin.mint(&subscriber, &10_000i128);
-    client.deposit_funds(&sub_id, &subscriber, &1_000i128, &None);
+    client.deposit_funds(&sub_id, &1_000i128, &None);
 
     let now = env.ledger().timestamp();
 
@@ -413,7 +413,7 @@ fn test_vacation_split_payees_blocked() {
     );
 
     token_admin.mint(&subscriber, &10_000i128);
-    client.deposit_funds(&sub_id, &subscriber, &1_000i128, &None);
+    client.deposit_funds(&sub_id, &1_000i128, &None);
 
     let now = env.ledger().timestamp();
 
@@ -460,7 +460,7 @@ fn test_vacation_past_subscription_expiration() {
     );
 
     token_admin.mint(&subscriber, &10_000i128);
-    client.deposit_funds(&sub_id, &subscriber, &1_000i128, &None);
+    client.deposit_funds(&sub_id, &1_000i128, &None);
 
     // Set vacation that starts after subscription expiration
     client.set_merchant_vacation(&merchant, &(expires_at - 100), &(expires_at + 5000));
@@ -489,12 +489,8 @@ fn test_vacation_deposit_blocked() {
     client.set_merchant_vacation(&merchant, &now, &(now + 3600));
 
     // Deposit should be blocked
-    let res = client.try_deposit_funds(
-        &sub_id,
-        &subscriber,
-        &500i128,
-        &None,
-    );
+    let res = client.try_deposit_funds(&sub_id, &500i128,
+        &None,);
     assert_eq!(res, Err(Ok(Error::VacationActive)));
 }
 
@@ -521,4 +517,54 @@ fn test_vacation_events_emitted() {
 
     // Clear vacation → should emit vacation_ended event
     client.clear_merchant_vacation(&merchant);
+}
+
+
+// ── Vacation Exit Edge Case ──────────────────────────────────────────────────
+
+#[test]
+fn test_exit_vacation_advances_last_payment_timestamp() {
+    let (env, client, token_admin, _) = setup();
+    let (sub_id, merchant, subscriber) = setup_merchant_and_sub(&env, &client, &token_admin);
+
+    let now = env.ledger().timestamp();
+    let vacation_start = now + 100;
+    let vacation_end = now + 7200; // 2-hour vacation
+
+    // Set vacation starting in 100 seconds
+    client.set_merchant_vacation(&merchant, &vacation_start, &vacation_end);
+
+    // Advance to middle of vacation (now + 4000 seconds)
+    // This puts us at +4000, which is +3000 into the vacation
+    env.ledger().set_timestamp(now + 4000);
+
+    // Advance past first charge interval (3600 seconds), so normally a charge would be due
+    // But we're in vacation, so the charge is blocked
+    let res = client.try_charge_subscription(&sub_id, &None);
+    assert_eq!(res, Err(Ok(Error::VacationActive)));
+
+    // Get subscription state at vacation end
+    let sub_before_exit = client.get_subscription(&sub_id);
+    let original_last_payment = sub_before_exit.last_payment_timestamp;
+
+    // Now exit vacation by advancing past vacation_end
+    env.ledger().set_timestamp(vacation_end + 1);
+
+    // Clear vacation to restore charging
+    client.clear_merchant_vacation(&merchant);
+
+    // Now a charge at vacation_end+1 should succeed
+    // The issue being tested: if last_payment_timestamp wasn't advanced to vacation_end,
+    // the subscriber would be back-charged for the entire vacation period
+    client.charge_subscription(&sub_id, &None);
+
+    let sub_after_exit = client.get_subscription(&sub_id);
+
+    // Verify that the charge happened and didn't go to InsufficientBalance
+    assert_eq!(sub_after_exit.status, SubscriptionStatus::Active);
+
+    // The subscription was charged, confirming it didn't retroactively charge
+    // for the vacation period. The next charge should only be due one interval
+    // from the current time, not from before the vacation.
+    assert!(sub_after_exit.prepaid_balance < 1000);
 }

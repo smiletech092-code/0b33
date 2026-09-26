@@ -111,6 +111,38 @@ let is_active = subscription_vault.get_emergency_stop_status();
 // Returns: false
 ```
 
+### Step 4: Reconcile Before Restarting Billing ⚠
+
+**Disabling the stop does not reconcile anything.** Lifting it restores
+`batch_charge` immediately, and any polling billing engine will fire a
+catch-up batch within one poll interval — before you have classified what was
+skipped, and using whatever nonce it last read.
+
+Before re-enabling the billing engine, follow the **Post-Emergency-Stop
+Reconciliation Runbook**:
+
+→ [`reconciliation_strategy.md` → Post-Emergency-Stop Reconciliation Runbook](reconciliation_strategy.md#post-emergency-stop-reconciliation-runbook)
+
+The minimum before you restart the scheduler:
+
+1. **Freeze the billing engine first**, then disable the stop. Do not use the
+   stop as the gate — it is what you are about to remove.
+2. Capture a reconciliation baseline for every accepted token *while the stop
+   is still engaged* — all reconciliation queries are read-only and stay
+   available under the stop. `generate_reconciliation_proof(token)` gives you a
+   snapshot with a `ledger_sequence` to diff the post-lift state against.
+3. Verify `get_token_reconciliation(token).is_balanced` is `true` for every
+   token **before** lifting, not after.
+4. Re-verify immediately after lifting, then classify every queued subscription
+   before charging.
+
+Note the semantics the runbook relies on: charges are **skipped, not
+deferred**. `last_payment_timestamp` is frozen and no catch-up queue is
+created, so a subscription that missed N intervals while stopped is charged
+**once** at the next due interval, not N times. Off-chain accruals that ran on
+a wall-clock timer will be overstated and must be rebased or voided against
+`Subscription.lifetime_charged`.
+
 ## Operations During Emergency Stop
 
 ### Blocked Operations (Financial Risk)
@@ -249,6 +281,11 @@ Use this checklist when responding to an incident:
 - [ ] Document incident timeline
 - [ ] Review response effectiveness
 - [ ] Update procedures if needed
+- [ ] Work through the
+      [Post-Emergency-Stop Reconciliation Runbook](reconciliation_strategy.md#post-emergency-stop-reconciliation-runbook)
+      and attach the pre-lift and post-lift reconciliation proofs to the record
+- [ ] Confirm the billing engine was re-enabled only after reconciliation, and
+      that the first post-lift batch was reviewed manually
 
 ## Example Integration
 

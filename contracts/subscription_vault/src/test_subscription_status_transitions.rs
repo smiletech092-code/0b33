@@ -6,15 +6,18 @@
 //!     - Active → Paused → Active   (pause / resume round-trip)
 //!     - Active → Cancelled          (terminal cancel)
 //!     - Active → InsufficientBalance driven by an underfunded charge
+//!     - GracePeriod → Active via resume_subscription (after deposit + sufficient balance)
 //!
 //!   Illegal transitions (must be rejected):
 //!     - charge_subscription while Cancelled → `Error::NotActive`
 //!     - charge_subscription while Paused   → `Error::NotActive`
 //!     - resume_subscription while Active   → idempotent Ok (status stays Active)
+//!     - resume_subscription on GracePeriod with insufficient balance → `Error::InsufficientBalance`
 //!
 //! Security invariants verified:
 //!   - A rejected charge on Paused/Cancelled does **not** mutate subscription state.
 //!   - An underfunded charge does **not** credit the merchant or update lifetime_charged.
+//!   - resume_subscription rejects GracePeriod subscriptions with insufficient balance.
 
 use crate::{ChargeExecutionResult, DataKey, Error, SubscriptionStatus, SubscriptionVault, SubscriptionVaultClient};
 use soroban_sdk::{
@@ -100,7 +103,7 @@ fn test_active_to_paused_to_active() {
     // Fund the subscription so the balance check in resume is satisfied.
     let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
     token_admin.mint(&subscriber, &PREPAID);
-    client.deposit_funds(&id, &subscriber, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
+    client.deposit_funds(&id, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
 
     let initial_balance = client.get_subscription(&id).prepaid_balance;
 
@@ -120,6 +123,36 @@ fn test_active_to_paused_to_active() {
     assert_eq!(sub_resumed.prepaid_balance, initial_balance);
 }
 
+/// Resuming from InsufficientBalance must not silently re-enable billing unless
+/// the prepaid balance is now sufficient for at least one interval charge.
+#[test]
+fn test_resume_from_insufficient_balance_requires_sufficient_balance() {
+    let (env, client, token, _) = setup();
+    let (id, subscriber, _) = create_sub(&env, &client);
+
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&subscriber, &AMOUNT - 1);
+    client.deposit_funds(&id, &subscriber, &(AMOUNT - 1), &None::<soroban_sdk::BytesN<32>>);
+
+    client.get_subscription(&id);
+    set_balance(&env, &client, id, AMOUNT - 1);
+    let sub_before = client.get_subscription(&id);
+    assert_eq!(sub_before.status, SubscriptionStatus::Active);
+
+    // Simulate the contract having already transitioned to InsufficientBalance,
+    // while only a partial top-up is available.
+    set_balance(&env, &client, id, AMOUNT - 1);
+    env.as_contract(&client.address, || {
+        let mut sub = env.storage().persistent().get(&DataKey::Sub(id)).unwrap().unwrap();
+        sub.status = SubscriptionStatus::InsufficientBalance;
+        env.storage().persistent().set(&DataKey::Sub(id), &sub);
+    });
+
+    let result = client.try_resume_subscription(&id, &subscriber);
+    assert_eq!(result, Err(Ok(Error::InsufficientBalance)));
+    assert_eq!(client.get_subscription(&id).status, SubscriptionStatus::InsufficientBalance);
+}
+
 // ── Valid transition: Active → Cancelled ─────────────────────────────────────
 
 /// Cancelling an Active subscription moves it to the terminal Cancelled state.
@@ -131,7 +164,7 @@ fn test_active_to_cancelled() {
 
     let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
     token_admin.mint(&subscriber, &PREPAID);
-    client.deposit_funds(&id, &subscriber, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
+    client.deposit_funds(&id, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
 
     let balance_before = client.get_subscription(&id).prepaid_balance;
     assert_eq!(client.get_subscription(&id).status, SubscriptionStatus::Active);
@@ -225,7 +258,7 @@ fn test_charge_paused_subscription_rejected() {
     // Fund the subscription so balance isn't the limiting factor.
     let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
     token_admin.mint(&subscriber, &PREPAID);
-    client.deposit_funds(&id, &subscriber, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
+    client.deposit_funds(&id, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
 
     client.pause_subscription(&id, &subscriber);
     assert_eq!(client.get_subscription(&id).status, SubscriptionStatus::Paused);
@@ -261,4 +294,117 @@ fn test_resume_active_subscription_is_idempotent() {
 
     // Status stays Active; no spurious state change.
     assert_eq!(client.get_subscription(&id).status, SubscriptionStatus::Active);
+}
+
+// ── Valid transition: GracePeriod → Active via resume_subscription ───────────
+
+/// When a subscription enters GracePeriod due to an underfunded charge,
+/// and the subscriber then deposits sufficient funds, calling resume_subscription
+/// must transition the subscription from GracePeriod back to Active.
+///
+/// This test verifies:
+///   1. A subscription can be moved into GracePeriod by charging with insufficient balance
+///      during the grace window (when grace_expires has not yet passed).
+///   2. The subscriber can deposit funds to rebuild the balance above the charge amount.
+///   3. resume_subscription successfully transitions GracePeriod → Active.
+///   4. The subscription retains its prepaid_balance and other fields through the transition.
+#[test]
+fn test_grace_period_to_active_via_resume_subscription() {
+    let (env, client, token, _) = setup();
+    let (id, subscriber, _) = create_sub(&env, &client);
+
+    // Set up the subscription to enter GracePeriod by charging with insufficient balance.
+    // We need:
+    //   - last_payment_timestamp = T0
+    //   - interval = INTERVAL
+    //   - grace_period = GRACE_PERIOD
+    //   - grace_expires = T0 + INTERVAL + GRACE_PERIOD
+    // Charging at T0 + INTERVAL + 1 is before grace_expires, so status → GracePeriod
+    // instead of InsufficientBalance.
+    env.ledger()
+        .with_mut(|l| l.timestamp = T0 + INTERVAL + 1);
+
+    let sub_before_charge = client.get_subscription(&id);
+    assert_eq!(sub_before_charge.status, SubscriptionStatus::Active);
+    assert_eq!(sub_before_charge.prepaid_balance, 0);
+
+    // Charge the Active subscription with zero balance while still in grace window.
+    // This should transition to GracePeriod.
+    let charge_result = client.try_charge_subscription(&id, &None::<soroban_sdk::BytesN<32>>);
+    assert!(charge_result.is_ok(), "charge during grace window should return Ok");
+
+    let sub_in_grace = client.get_subscription(&id);
+    assert_eq!(
+        sub_in_grace.status, SubscriptionStatus::GracePeriod,
+        "subscription should be in GracePeriod after charge with insufficient balance during grace window"
+    );
+    assert_eq!(sub_in_grace.prepaid_balance, 0);
+
+    // Now, the subscriber deposits funds to cover the next charge.
+    // This requires: prepaid_balance >= amount (10_000_000).
+    // We deposit exactly the charge amount.
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&subscriber, &AMOUNT);
+
+    let sub_before_deposit = client.get_subscription(&id);
+    client.deposit_funds(&id, &subscriber, &AMOUNT, &None::<soroban_sdk::BytesN<32>>);
+
+    let sub_after_deposit = client.get_subscription(&id);
+    assert_eq!(sub_after_deposit.status, SubscriptionStatus::GracePeriod);
+    assert_eq!(sub_after_deposit.prepaid_balance, AMOUNT);
+
+    // Now call resume_subscription to transition from GracePeriod → Active.
+    let resume_result = client.try_resume_subscription(&id, &subscriber);
+    assert_eq!(
+        resume_result, Ok(Ok(())),
+        "resume_subscription should succeed and return Ok(())"
+    );
+
+    let sub_after_resume = client.get_subscription(&id);
+    assert_eq!(
+        sub_after_resume.status, SubscriptionStatus::Active,
+        "subscription should be Active after resume_subscription"
+    );
+    // Prepaid balance is preserved.
+    assert_eq!(sub_after_resume.prepaid_balance, AMOUNT);
+    // Other fields like subscriber and merchant should be unchanged.
+    assert_eq!(sub_after_resume.subscriber, sub_in_grace.subscriber);
+    assert_eq!(sub_after_resume.merchant, sub_in_grace.merchant);
+    assert_eq!(sub_after_resume.amount, sub_in_grace.amount);
+    assert_eq!(sub_after_resume.interval_seconds, sub_in_grace.interval_seconds);
+}
+
+/// Invariant: resume_subscription on a GracePeriod subscription with insufficient
+/// balance (prepaid < amount) must be rejected with Error::InsufficientBalance,
+/// and the subscription status must remain GracePeriod.
+#[test]
+fn test_resume_grace_period_with_insufficient_balance_rejected() {
+    let (env, client, _, _) = setup();
+    let (id, subscriber, _) = create_sub(&env, &client);
+
+    // Move to GracePeriod with zero balance.
+    env.ledger()
+        .with_mut(|l| l.timestamp = T0 + INTERVAL + 1);
+    let _ = client.try_charge_subscription(&id, &None::<soroban_sdk::BytesN<32>>);
+
+    let sub_in_grace = client.get_subscription(&id);
+    assert_eq!(sub_in_grace.status, SubscriptionStatus::GracePeriod);
+    assert_eq!(sub_in_grace.prepaid_balance, 0);
+
+    // Try to resume without depositing funds — prepaid_balance (0) < amount (10M)
+    let resume_result = client.try_resume_subscription(&id, &subscriber);
+    assert_eq!(
+        resume_result,
+        Err(Ok(Error::InsufficientBalance)),
+        "resume_subscription must reject GracePeriod subscription with insufficient balance"
+    );
+
+    // Status and balance must remain unchanged.
+    let sub_after_failed_resume = client.get_subscription(&id);
+    assert_eq!(
+        sub_after_failed_resume.status,
+        SubscriptionStatus::GracePeriod,
+        "status must remain GracePeriod after failed resume"
+    );
+    assert_eq!(sub_after_failed_resume.prepaid_balance, 0);
 }

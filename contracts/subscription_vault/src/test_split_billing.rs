@@ -152,7 +152,7 @@ fn test_split_charge_distribution_and_dust() {
 
     // Deposit funds
     token_admin.mint(&subscriber, &10_000i128);
-    client.deposit_funds(&sub_id, &subscriber, &1_000i128, &None);
+    client.deposit_funds(&sub_id, &1_000i128, &None);
 
     // Advance time and charge
     env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
@@ -223,7 +223,7 @@ fn test_split_payees_paused_or_blocklisted() {
     );
 
     token_admin.mint(&subscriber, &10_000i128);
-    client.deposit_funds(&sub_id, &subscriber, &1_000i128, &None);
+    client.deposit_funds(&sub_id, &1_000i128, &None);
 
     // 1. Blocklist one payee
     let admin = client.get_admin();
@@ -299,7 +299,7 @@ fn test_split_payees_removal_mid_billing() {
     );
 
     token_admin.mint(&subscriber, &10_000i128);
-    client.deposit_funds(&sub_id, &subscriber, &1_000i128, &None);
+    client.deposit_funds(&sub_id, &1_000i128, &None);
 
     // Update/remove split payees (set to None)
     client.update_split_payees(&subscriber, &sub_id, &None);

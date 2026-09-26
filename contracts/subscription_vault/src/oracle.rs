@@ -2,6 +2,11 @@
 //!
 //! Includes a deviation circuit breaker that rejects price spikes exceeding a
 //! configurable basis-point threshold relative to the median of recent samples.
+//!
+//! Staleness is controlled at runtime by `OracleConfig.max_age_seconds`
+//! (`set_oracle_config`), not by a compile-time `MAX_ORACLE_AGE`. The threshold
+//! is vault-global by design; see `docs/oracle_pricing.md` ("Per-merchant
+//! staleness threshold") for the rationale and future override sketch.
 
 use crate::safe_math::{safe_add, safe_div, safe_mul, safe_pow, safe_sub};
 use crate::types::{
@@ -319,8 +324,18 @@ pub fn resolve_charge_amount(env: &Env, subscription: &Subscription) -> Result<i
         let ceil_adjust = safe_sub(price.price, 1)?;
         let token_amount = safe_div(safe_add(numerator, ceil_adjust)?, price.price)?;
 
+        // The resolved charge came out to zero (or negative). This is a fault
+        // in the *amount*, not in the price: `subscription.amount` was 0, so the
+        // ceiling division truncated to 0. Report `InvalidAmount` rather than
+        // `OraclePriceInvalid` — the price already passed every validity check
+        // above, and reporting a price error here would send operators hunting
+        // for an oracle fault that does not exist.
+        //
+        // Note the asymmetry with `price == 1`: that value is *valid* and
+        // yields the largest possible charge (`amount * 10^decimals`), not a
+        // zero one. See docs/oracle_pricing.md -> "Degenerate prices".
         if token_amount <= 0 {
-            return Err(Error::OraclePriceInvalid);
+            return Err(Error::InvalidAmount);
         }
         Ok(token_amount)
     }

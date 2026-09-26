@@ -64,7 +64,7 @@ fn test_expiration_timing_and_charging() {
         &Some(expires_at),
     &None::<u32>,
     );
-    client.deposit_funds(&sub_id, &subscriber, &(amount * 5, &None::<soroban_sdk::BytesN<32>>));
+    client.deposit_funds(&sub_id, &(amount * 5, &None::<soroban_sdk::BytesN<32>>));
 
     // Before expiry: charge succeeds
     env.ledger().with_mut(|l| l.timestamp = T0 + INTERVAL);
@@ -234,7 +234,7 @@ fn test_deposit_rejected_when_expired() {
     let _ = client.try_charge_subscription(&sub_id, &None::<soroban_sdk::BytesN<32>>);
 
     // subscription.is_expired(now) is true; deposit should be rejected
-    let res = client.try_deposit_funds(&sub_id, &subscriber, &min_topup, &None::<soroban_sdk::BytesN<32>>);
+    let res = client.try_deposit_funds(&sub_id, &min_topup, &None::<soroban_sdk::BytesN<32>>);
     assert_eq!(res, Err(Ok(Error::SubscriptionExpired)));
 }
 
@@ -288,6 +288,31 @@ fn test_reject_expiration_in_the_past() {
         &None::<i128>,
         &Some(expires_at),
     &None::<u32>,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidExpiration)));
+}
+
+/// Reject the default-token `create_subscription` entry point (not just
+/// `create_subscription_with_token`) when `expires_at` is already in the past.
+#[test]
+fn test_create_subscription_default_token_rejects_past_expiration() {
+    let (env, client, _token_client, _token_admin, _) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let expires_at = T0 - 1; // one second before current ledger time
+
+    let res = client.try_create_subscription(
+        &subscriber,
+        &merchant,
+        &1_000_000i128,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &Some(expires_at),
+        &None::<u32>,
+        &None::<Symbol>,
+        &false,
     );
     assert_eq!(res, Err(Ok(Error::InvalidExpiration)));
 }
@@ -445,10 +470,7 @@ fn test_ledger_expiration_none_accepted() {
         l.timestamp = T0 + 30 * INTERVAL;
         l.sequence_number = 1_000_000;
     });
-    client.deposit_funds(
-        &sub_id,
-        &subscriber,
-        &(1_000_000i128 * 5),
+    client.deposit_funds(&sub_id, &(1_000_000i128 * 5),
         &None::<soroban_sdk::BytesN<32>>,
     );
     client.charge_subscription(&sub_id, &None::<soroban_sdk::BytesN<32>>);
@@ -561,10 +583,7 @@ fn test_charge_rejected_when_ledger_bound_met() {
         &Some(bound_seq),
     &None::<u32>,
     );
-    client.deposit_funds(
-        &sub_id,
-        &subscriber,
-        &(1_000_000i128 * 5),
+    client.deposit_funds(&sub_id, &(1_000_000i128 * 5),
         &None::<soroban_sdk::BytesN<32>>,
     );
 
@@ -613,12 +632,8 @@ fn test_deposit_rejected_when_ledger_bound_met() {
     env.ledger().with_mut(|l| l.sequence_number = bound_seq + 1);
     let _ = client.try_charge_subscription(&sub_id, &None::<soroban_sdk::BytesN<32>>);
 
-    let res = client.try_deposit_funds(
-        &sub_id,
-        &subscriber,
-        &1_000_000i128,
-        &None::<soroban_sdk::BytesN<32>>,
-    );
+    let res = client.try_deposit_funds(&sub_id, &1_000_000i128,
+        &None::<soroban_sdk::BytesN<32>>,);
     assert_eq!(res, Err(Ok(Error::SubscriptionExpired)));
 }
 
@@ -649,10 +664,7 @@ fn test_both_bounds_set_ledger_fires_first() {
         &Some(bound_seq),
     &None::<u32>,
     );
-    client.deposit_funds(
-        &sub_id,
-        &subscriber,
-        &(1_000_000i128 * 5),
+    client.deposit_funds(&sub_id, &(1_000_000i128 * 5),
         &None::<soroban_sdk::BytesN<32>>,
     );
 
@@ -693,10 +705,7 @@ fn test_both_bounds_set_wall_clock_fires_first() {
         &Some(bound_seq),
     &None::<u32>,
     );
-    client.deposit_funds(
-        &sub_id,
-        &subscriber,
-        &(1_000_000i128 * 5),
+    client.deposit_funds(&sub_id, &(1_000_000i128 * 5),
         &None::<soroban_sdk::BytesN<32>>,
     );
 
@@ -1231,6 +1240,8 @@ fn test_is_expired_dual_bound_invariant() {
             grace_start_timestamp: None,
             cancel_at: None,
             expires_at_ledger,
+            sub_account_label: None,
+            proration_enabled: false,
         }
     }
 
@@ -1347,6 +1358,8 @@ fn test_is_expired_dual_bound_invariant_randomized() {
             grace_start_timestamp: None,
             cancel_at: None,
             expires_at_ledger,
+            sub_account_label: None,
+            proration_enabled: false,
         }
     }
 

@@ -8,7 +8,7 @@ use crate::types::{
     AcceptedToken, AdminConfigChangedEvent, AdminProposal, AdminProposalCancelledEvent,
     AdminProposalClaimedEvent, AdminProposalCreatedEvent, AdminRotatedEvent, BatchChargeResult,
     DataKey, Error, FeeTokenConfiguredEvent, PendingTreasuryChange, RecoveryEvent, RecoveryReason,
-    TreasuryChangeExecutedEvent, TreasuryChangeQueuedEvent, TOPIC_RECOVERY, SUB_TTL_EXTEND_TO,
+    TreasuryChangeExecutedEvent, TreasuryChangeQueuedEvent, BATCH_MAX_SIZE, TOPIC_RECOVERY, SUB_TTL_EXTEND_TO,
     SUB_TTL_THRESHOLD,
 };
 use crate::{
@@ -196,7 +196,7 @@ pub fn do_init(
 
     write_config(env, &DataKey::Admin, &admin);
     write_config(env, &DataKey::MinTopup, &min_topup);
-    instance.set(&DataKey::GracePeriod, &grace_period);
+    write_config(env, &DataKey::GracePeriod, &grace_period);
 
     env.events().publish(
         (Symbol::new(env, "initialized"),),
@@ -250,15 +250,104 @@ pub fn require_admin_or_operator_auth(env: &Env, caller: &Address) -> Result<(),
     Err(Error::Unauthorized)
 }
 
+// ── Multi-Sig Enforcement ────────────────────────────────────────────────────
+
+/// Enforce multi-sig approval for critical admin operations.
+/// 
+/// This function checks that a valid governance proposal exists with sufficient
+/// quorum for the specified operation. Critical operations that touch funds or
+/// halt the contract require multi-sig guardian approval before execution.
+pub fn require_multisig_approval(
+    env: &Env,
+    kind: crate::types::ProposalKind,
+    target: &Address,
+    target2: Option<&Address>,
+    target3: u32,
+) -> Result<u64, Error> {
+    // Check if we have any guardians configured
+    let guardians = crate::governance::list_guardians(env);
+    if guardians.is_empty() {
+        // If no guardians are configured, fall back to single admin for backward compatibility
+        // This maintains the existing behavior until guardians are setup
+        return Ok(0);
+    }
+
+    // Look for a valid proposal that matches this operation
+    let current_proposal_id = crate::governance::get_current_proposal_id(env);
+    
+    // Search recent proposals to find a matching one
+    for i in 0..10 {  // Check last 10 proposals
+        if current_proposal_id < i {
+            break;
+        }
+        let proposal_id = current_proposal_id - i;
+        
+        if let Some(proposal) = crate::governance::get_proposal(env, proposal_id) {
+            // Check if this proposal matches our operation
+            if proposal.kind == kind 
+                && proposal.target == *target
+                && proposal.target2.as_ref() == target2
+                && proposal.target3 == target3
+                && !proposal.executed
+            {
+                // Check if proposal has passed its ETA (timelock)
+                let now = env.ledger().timestamp();
+                if now < proposal.eta {
+                    return Err(Error::MultiSigProposalExpired);
+                }
+                
+                // Check if quorum is reached
+                let (yes_weight, total_weight) = crate::governance::calculate_quorum(env, &proposal);
+                let quorum_needed = (total_weight as u64 * proposal.quorum_bps as u64) / 10_000;
+                
+                if yes_weight as u64 >= quorum_needed {
+                    return Ok(proposal_id);
+                } else {
+                    return Err(Error::MultiSigQuorumNotReached);
+                }
+            }
+        }
+    }
+    
+    Err(Error::MultiSigProposalNotFound)
+}
+
+/// Mark a multi-sig proposal as executed to prevent replay.
+pub fn consume_multisig_proposal(env: &Env, proposal_id: u64) -> Result<(), Error> {
+    if proposal_id == 0 {
+        // No proposal to consume (single admin mode)
+        return Ok(());
+    }
+    
+    // Mark proposal as executed - this is handled by the governance module
+    crate::governance::do_execute_proposal(env, proposal_id)
+}
+
+/// Check if multi-sig enforcement is enabled (i.e., guardians are configured).
+pub fn is_multisig_enabled(env: &Env) -> bool {
+    !crate::governance::list_guardians(env).is_empty()
+}
+
+// ── Configuration Functions ───────────────────────────────────────────────────
+
 pub fn do_set_min_topup(env: &Env, admin: Address, min_topup: i128) -> Result<(), Error> {
     require_admin_auth(env, &admin)?;
     if min_topup <= 0 {
         return Err(Error::InvalidAmount);
     }
+    let old_min_topup = get_min_topup(env).unwrap_or(0);
     enforce_config_cooldown(env, "MinTopup")?;
     write_config(env, &DataKey::MinTopup, &min_topup);
-    env.events()
-        .publish((Symbol::new(env, "min_topup_updated"),), min_topup);
+    env.events().publish(
+        (Symbol::new(env, "min_topup_updated"),),
+        crate::types::MinTopupUpdatedEvent {
+            admin,
+            old_min_topup,
+            new_min_topup: min_topup,
+            timestamp: env.ledger().timestamp(),
+            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+        },
+    );
     Ok(())
 }
 
@@ -269,18 +358,14 @@ pub fn get_min_topup(env: &Env) -> Result<i128, Error> {
 pub fn do_set_grace_period(env: &Env, admin: Address, grace_period: u64) -> Result<(), Error> {
     require_admin_auth(env, &admin)?;
     enforce_config_cooldown(env, "GracePeriod")?;
-    env.storage()
-        .instance()
-        .set(&DataKey::GracePeriod, &grace_period);
+    write_config(env, &DataKey::GracePeriod, &grace_period);
+    env.events()
+        .publish((Symbol::new(env, "grace_period_updated"),), grace_period);
     Ok(())
 }
 
 pub fn get_grace_period(env: &Env) -> Result<u64, Error> {
-    Ok(env
-        .storage()
-        .instance()
-        .get(&DataKey::GracePeriod)
-        .unwrap_or(0))
+    read_config(env, &DataKey::GracePeriod).ok_or(Error::NotInitialized)
 }
 
 pub fn do_set_subscriber_create_cap(env: &Env, admin: Address, cap: u32) -> Result<(), Error> {
@@ -322,6 +407,15 @@ pub fn add_accepted_token(
 ) -> Result<(), Error> {
     require_admin_auth(env, &admin)?;
 
+    // Require multi-sig approval for adding tokens
+    let proposal_id = require_multisig_approval(
+        env,
+        crate::types::ProposalKind::AddAcceptedToken,
+        &token,
+        None,
+        decimals,
+    )?;
+
     let storage = env.storage().instance();
     if !storage.has(&accepted_token_decimals_key(&token)) {
         enforce_config_cooldown(env, "AcceptedTokens")?;
@@ -330,6 +424,10 @@ pub fn add_accepted_token(
         storage.set(&accepted_tokens_key(), &tokens);
     }
     storage.set(&accepted_token_decimals_key(&token), &decimals);
+    
+    // Mark the multi-sig proposal as consumed
+    consume_multisig_proposal(env, proposal_id)?;
+    
     Ok(())
 }
 
@@ -340,6 +438,15 @@ pub fn remove_accepted_token(env: &Env, admin: Address, token: Address) -> Resul
     if token == default_token {
         return Err(Error::InvalidInput);
     }
+
+    // Require multi-sig approval for removing tokens
+    let proposal_id = require_multisig_approval(
+        env,
+        crate::types::ProposalKind::RemoveAcceptedToken,
+        &token,
+        None,
+        0, // no additional parameter needed for removal
+    )?;
 
     enforce_config_cooldown(env, "AcceptedTokens")?;
 
@@ -354,6 +461,10 @@ pub fn remove_accepted_token(env: &Env, admin: Address, token: Address) -> Resul
         }
     }
     storage.set(&accepted_tokens_key(), &next);
+    
+    // Mark the multi-sig proposal as consumed
+    consume_multisig_proposal(env, proposal_id)?;
+    
     Ok(())
 }
 
@@ -401,13 +512,19 @@ pub(crate) fn execute_batch_charge(
     let now = env.ledger().timestamp();
     // Read all admin config values once so they are cached across the batch loop.
     let cached_admin = read_cached_admin_config(env);
+    // Cache per-merchant paused/vacation status across the batch loop so
+    // subscriptions sharing a merchant only hit storage once for it.
+    let mut merchant_cache: soroban_sdk::Map<Address, (bool, bool)> = soroban_sdk::Map::new(env);
     let mut results = Vec::new(env);
+    // Cache oracle prices per (merchant, token) pair so subscriptions sharing a
+    // merchant and token within the batch don't redundantly re-query the oracle.
+    let mut price_cache: std::vec::Vec<(Address, Address, u128)> = std::vec::Vec::new();
     for id in subscription_ids.iter() {
         let admin_ref = match &cached_admin {
             Ok(cfg) => Some(cfg),
             Err(_) => None,
         };
-        let r = charge_one(env, id, now, None, admin_ref);
+        let r = charge_one(env, id, now, None, admin_ref, Some(&mut merchant_cache));
         let res = match r {
             Ok(ChargeExecutionResult::Charged) => BatchChargeResult {
                 success: true,
@@ -440,6 +557,26 @@ pub(crate) fn execute_batch_charge(
     results
 }
 
+/// Charge a batch of subscriptions. Admin only.
+///
+/// # Input validation
+///
+/// Both argument-shape checks run *before* the nonce is consumed, so a
+/// malformed batch is a total no-op: no state is mutated and the caller's
+/// nonce is still valid for a corrected retry.
+///
+/// 1. **Batch length** — at most [`BATCH_MAX_SIZE`] ids. Larger batches are
+///    rejected with [`Error::InvalidInput`]. This is a contract-level guard,
+///    not a network one: without it an oversized batch would run past the
+///    Soroban per-transaction instruction limit and fail with a generic
+///    execution error that the caller cannot distinguish from out-of-gas.
+///    Oversized batches are rejected wholesale — there are no partial results.
+/// 2. **Duplicate ids** — a repeated id is rejected with
+///    [`Error::InvalidInput`], matching the size check. The size check runs
+///    first so an oversized batch is reported as oversized.
+///
+/// An empty batch is an explicit no-op that returns an empty result vector
+/// without consuming the nonce.
 pub fn do_batch_charge(
     env: &Env,
     subscription_ids: &Vec<u32>,
@@ -447,7 +584,29 @@ pub fn do_batch_charge(
 ) -> Result<Vec<BatchChargeResult>, Error> {
     let admin = require_stored_admin_auth(env)?;
 
-    // Nonce check must run before any state mutation to prevent replay.
+    // Validate batch size before processing. Reported as InvalidInput so the
+    // caller can distinguish "this input shape is rejected" from an item-level
+    // charge failure, and so it cannot be confused with a network-level
+    // instruction-budget abort.
+    if subscription_ids.len() > BATCH_MAX_SIZE {
+        return Err(Error::InvalidInput);
+    }
+
+    // Empty batch is allowed as a no-op
+    if subscription_ids.len() == 0 {
+        return Ok(Vec::new(env));
+    }
+
+    // Check for duplicate IDs and reject the entire batch if found
+    let mut seen_ids = soroban_sdk::Vec::<u32>::new(env);
+    for id in subscription_ids.iter() {
+        if seen_ids.contains(&id) {
+            return Err(Error::InvalidInput); // Clear error for duplicate IDs
+        }
+        seen_ids.push_back(id);
+    }
+
+    // Nonce check must run after input validation but before any state mutation to prevent replay.
     // Domain DOMAIN_BATCH_CHARGE separates this counter from other admin ops.
     crate::nonce::check_and_advance(env, &admin, crate::nonce::DOMAIN_BATCH_CHARGE, nonce)?;
 
@@ -462,7 +621,7 @@ pub fn do_charge_subscription(
     let _admin = require_stored_admin_auth(env)?;
 
     let now = env.ledger().timestamp();
-    charge_one(env, subscription_id, now, None, None)
+    charge_one(env, subscription_id, now, None, None, None)
 }
 
 /// Performs a single usage-based charge. Admin only.
@@ -510,11 +669,23 @@ pub fn do_rotate_admin(
         return Err(Error::InvalidNewAdmin);
     }
 
+    // Require multi-sig approval for admin rotation
+    let proposal_id = require_multisig_approval(
+        env,
+        crate::types::ProposalKind::RotateAdmin,
+        &new_admin,
+        None,
+        0, // no additional target3 parameter needed
+    )?;
+
     enforce_config_cooldown(env, "Admin")?;
 
     // Atomic swap: write new admin before emitting the event so any indexer
     // that reads state on the event sees the already-updated value.
     write_config(env, &DataKey::Admin, &new_admin);
+
+    // Mark the multi-sig proposal as consumed
+    consume_multisig_proposal(env, proposal_id)?;
 
     env.events().publish(
         (Symbol::new(env, "admin_rotated"),),
@@ -544,6 +715,23 @@ pub fn do_recover_stranded_funds(
         return Err(Error::InvalidRecoveryAmount);
     }
 
+    // Require multi-sig approval for fund recovery
+    // We use the amount truncated to u32 as a reasonable approximation
+    // for the proposal matching. For large amounts, consider splitting.
+    let amount_u32 = if amount > u32::MAX as i128 {
+        u32::MAX
+    } else {
+        amount as u32
+    };
+    
+    let proposal_id = require_multisig_approval(
+        env,
+        crate::types::ProposalKind::RecoverStrandedFunds,
+        &recipient,
+        Some(&token),
+        amount_u32,
+    )?;
+
     // Check for replay protection
     let recovery_key = DataKey::Recovery(recovery_id.clone());
     if env.storage().persistent().has(&recovery_key) {
@@ -564,6 +752,9 @@ pub fn do_recover_stranded_funds(
 
     // Mark recovery as executed
     env.storage().persistent().set(&recovery_key, &true);
+
+    // Mark the multi-sig proposal as consumed
+    consume_multisig_proposal(env, proposal_id)?;
 
     let recovery_event = RecoveryEvent {
         admin: admin.clone(),
@@ -590,7 +781,9 @@ pub fn do_recover_stranded_funds(
 
 /// Set protocol fee basis points and treasury address. Admin only.
 ///
-/// fee_bps must be in 0..=10_000. Setting fee_bps to 0 disables fee collection.
+/// fee_bps must be in 0..=MAX_PROTOCOL_FEE_BIPS (500). Setting fee_bps to 0
+/// disables fee collection. Values above the cap are rejected with
+/// `ProtocolFeeTooHigh`.
 const TREASURY_CHANGE_DELAY_SECS: u64 = 48 * 24 * 60 * 60;
 
 pub fn queue_treasury_change(
@@ -600,12 +793,21 @@ pub fn queue_treasury_change(
     fee_bps: u32,
 ) -> Result<(), Error> {
     require_admin_auth(env, &admin)?;
-    if fee_bps > 10_000 {
-        return Err(Error::InvalidInput);
+    if fee_bps > MAX_PROTOCOL_FEE_BIPS {
+        return Err(Error::ProtocolFeeTooHigh);
     }
     if env.storage().persistent().has(&DataKey::PendingTreasuryChange) {
         return Err(Error::InvalidInput);
     }
+
+    // Require multi-sig approval for protocol fee changes
+    let proposal_id = require_multisig_approval(
+        env,
+        crate::types::ProposalKind::SetProtocolFee,
+        &treasury,
+        None,
+        fee_bps,
+    )?;
 
     let effective_at = env.ledger().timestamp().saturating_add(TREASURY_CHANGE_DELAY_SECS);
     let pending = PendingTreasuryChange {
@@ -621,6 +823,10 @@ pub fn queue_treasury_change(
     enforce_config_cooldown(env, "ProtocolFee")?;
     write_config(env, &DataKey::FeeBps, &fee_bps);
     write_config(env, &DataKey::Treasury, &treasury);
+    
+    // Mark the multi-sig proposal as consumed
+    consume_multisig_proposal(env, proposal_id)?;
+    
     env.events().publish(
         (Symbol::new(env, "treasury_change_queued"),),
         TreasuryChangeQueuedEvent {
@@ -751,6 +957,7 @@ pub fn do_set_auto_pause_threshold(env: &Env, admin: Address, threshold: u32) ->
 // ── Two-step admin proposal ──────────────────────────────────────────────────
 
 const PROPOSAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+const ADMIN_PROPOSAL_COOLDOWN_SECS: u64 = 24 * 60 * 60;
 
 fn proposal_key(env: &Env) -> Symbol {
     Symbol::new(env, "admin_proposal")
@@ -801,6 +1008,10 @@ pub fn do_claim_admin_role(env: &Env, claimant: Address) -> Result<(), Error> {
         .ok_or(Error::ProposalNotFound)?;
 
     let now = env.ledger().timestamp();
+    if now < proposal.proposed_at.saturating_add(ADMIN_PROPOSAL_COOLDOWN_SECS) {
+        return Err(Error::ProposalCooldownActive);
+    }
+
     if now > proposal.expires_at {
         storage.remove(&proposal_key(env));
         return Err(Error::ProposalExpired);
@@ -943,7 +1154,15 @@ pub fn do_migrate_config_to_persistent_internal(env: &Env) -> Result<(), Error> 
         instance.remove(&DataKey::MinTopup);
     }
 
-    // 4. NextId
+    // 4. GracePeriod
+    if instance.has(&DataKey::GracePeriod) {
+        let val: u64 = instance.get(&DataKey::GracePeriod).unwrap_or(0);
+        persistent.set(&DataKey::GracePeriod, &val);
+        crate::subscription::maybe_extend_ttl(env, &DataKey::GracePeriod, SUB_TTL_THRESHOLD, SUB_TTL_EXTEND_TO);
+        instance.remove(&DataKey::GracePeriod);
+    }
+
+    // 5. NextId
     if instance.has(&DataKey::NextId) {
         let val: u32 = instance.get(&DataKey::NextId).unwrap_or(0);
         persistent.set(&DataKey::NextId, &val);

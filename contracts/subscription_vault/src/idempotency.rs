@@ -6,18 +6,44 @@
 //! different entrypoints does **not** produce a replay collision.
 //!
 //! Storage key: `DataKey::IdemKey(subscription_id)` stores `IdemRingBuffer`.
+//!
+//! ## Replay-protection window
+//!
+//! Each entry stores the hash **and** the ledger timestamp at insertion.
+//! `check_key` ignores entries older than `IDEM_TTL_SECS`; they are treated
+//! as if they were never inserted.  This bounds the replay-protection window
+//! to a fixed time duration rather than a fixed count of operations, closing
+//! the ring-cycling attack described in issue #13.
+//!
+//! `push_key` still evicts the oldest slot by cursor position when the buffer
+//! is full, so storage usage stays bounded at `IDEM_HISTORY` entries regardless
+//! of charge frequency.
 
 use crate::types::DataKey;
 use soroban_sdk::{contracttype, BytesN, Env, Vec};
 
-/// Maximum number of idempotency keys retained per subscription.
-pub(crate) const IDEM_HISTORY: u32 = 10;
+/// Number of idempotency slots retained per subscription.
+///
+/// 64 slots comfortably covers high-frequency billing (e.g. daily charges
+/// over two months) while keeping per-subscription storage overhead small.
+pub(crate) const IDEM_HISTORY: u32 = 64;
 
-/// Ring buffer of recently seen idempotency-key hashes.
+/// Duration in seconds for which an idempotency entry remains active.
+///
+/// Set to 7 days: long enough to survive any reasonable retry window for
+/// weekly or monthly subscriptions, short enough that a cycling attack
+/// would require 64 charges within the TTL window to succeed — a scenario
+/// that cannot happen under normal subscription billing frequencies.
+pub(crate) const IDEM_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+
+/// Ring buffer of recently seen idempotency-key hashes with insertion timestamps.
+///
+/// Each entry is `(hash, inserted_at_timestamp)`.  Entries older than
+/// `IDEM_TTL_SECS` are considered expired and will not match on lookup.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub(crate) struct IdemRingBuffer {
-    pub entries: Vec<BytesN<32>>,
+    pub entries: Vec<(BytesN<32>, u64)>,
     pub cursor: u32,
 }
 
@@ -51,7 +77,9 @@ pub fn hash_idem_key(
 
 /// Load the ring buffer for `subscription_id`.
 ///
-/// Returns an empty buffer when no idempotency key has ever been stored.
+/// Returns an empty buffer when no idempotency key has ever been stored,
+/// or when the stored value cannot be deserialized (e.g. old on-chain format
+/// from before the timestamp migration).
 fn load_buffer(env: &Env, subscription_id: u32) -> IdemRingBuffer {
     env.storage()
         .instance()
@@ -69,13 +97,30 @@ fn save_buffer(env: &Env, subscription_id: u32, buf: &IdemRingBuffer) {
         .set(&DataKey::IdemKey(subscription_id), buf);
 }
 
-/// Check whether `hashed` already exists in the ring buffer.
+/// Check whether `hashed` already exists in the ring buffer **and** is still
+/// within the TTL window.
 ///
-/// Returns `true` when the key is a duplicate (replay).
+/// Returns `true` when the key is a live duplicate (replay).
+/// Expired entries are skipped and treated as absent.
 pub fn check_key(env: &Env, subscription_id: u32, hashed: &BytesN<32>) -> bool {
+    check_key_at(env, subscription_id, hashed, env.ledger().timestamp())
+}
+
+/// Testable variant of `check_key` that accepts an explicit `now` timestamp.
+pub(crate) fn check_key_at(
+    env: &Env,
+    subscription_id: u32,
+    hashed: &BytesN<32>,
+    now: u64,
+) -> bool {
     let buf = load_buffer(env, subscription_id);
     for entry in buf.entries.iter() {
-        if entry == *hashed {
+        let (stored_hash, inserted_at) = entry;
+        // Skip entries that have aged out of the replay-protection window.
+        if now.saturating_sub(inserted_at) >= IDEM_TTL_SECS {
+            continue;
+        }
+        if stored_hash == *hashed {
             return true;
         }
     }
@@ -84,18 +129,22 @@ pub fn check_key(env: &Env, subscription_id: u32, hashed: &BytesN<32>) -> bool {
 
 /// Insert a new idempotency key hash into the ring buffer.
 ///
+/// `now` must be the current ledger timestamp so that the TTL check in
+/// `check_key` can determine whether each entry is still active.
+///
 /// When the buffer is full the oldest entry (at `cursor`) is silently
 /// overwritten.
-pub fn push_key(env: &Env, subscription_id: u32, hashed: &BytesN<32>) {
+pub fn push_key(env: &Env, subscription_id: u32, hashed: &BytesN<32>, now: u64) {
     let mut buf = load_buffer(env, subscription_id);
+    let entry = (hashed.clone(), now);
     if buf.entries.len() < IDEM_HISTORY {
-        buf.entries.push_back(hashed.clone());
+        buf.entries.push_back(entry);
     } else {
         let idx = buf.cursor as usize % IDEM_HISTORY as usize;
         if idx < buf.entries.len() as usize {
-            buf.entries.set(idx as u32, hashed.clone());
+            buf.entries.set(idx as u32, entry);
         } else {
-            buf.entries.push_back(hashed.clone());
+            buf.entries.push_back(entry);
         }
     }
     buf.cursor = buf.cursor.wrapping_add(1) % IDEM_HISTORY;

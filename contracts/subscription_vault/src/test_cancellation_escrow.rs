@@ -20,8 +20,7 @@ fn setup_cancelled_with_balance() -> (TestEnv, u32, Address, Address) {
         fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
     test_env.stellar_token_client().mint(&subscriber, &PREPAID);
     test_env
-        .client
-        .deposit_funds(&id, &subscriber, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
+        .client.deposit_funds(&id, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
     test_env
         .client
         .cancel_subscription(&id, &subscriber);
@@ -326,8 +325,7 @@ fn test_merchant_cancel_also_creates_escrow() {
         fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
     test_env.stellar_token_client().mint(&subscriber, &PREPAID);
     test_env
-        .client
-        .deposit_funds(&id, &subscriber, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
+        .client.deposit_funds(&id, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
 
     test_env
         .client

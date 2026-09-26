@@ -58,7 +58,7 @@ fn create_and_fund_sub(
         &None::<Address>,
     );
 
-    client.deposit_funds(&id, &subscriber, &DEPOSIT_AMOUNT);
+    client.deposit_funds(&id, &DEPOSIT_AMOUNT);
     (id, subscriber, merchant)
 }
 
@@ -183,7 +183,7 @@ fn test_merchant_dust_balance_drain() {
         &None::<Address>,
     );
 
-    client.deposit_funds(&id, &subscriber, &dust_amount);
+    client.deposit_funds(&id, &dust_amount);
 
     let now = 1_000_000 + INTERVAL + 1;
     env.ledger().set_timestamp(now);

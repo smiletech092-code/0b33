@@ -267,14 +267,14 @@ fn protocol_fee_cooldown() {
 
     // Immediately again -- rejected.
     assert_eq!(
-        client.try_set_protocol_fee(&admin, &treasury, &1000u32),
+        client.try_set_protocol_fee(&admin, &treasury, &300u32),
         Ok(Err(Error::CooldownActive))
     );
 
     // After cooldown -- succeeds.
     env.ledger().with_mut(|li| li.timestamp = 1000 + COOLDOWN);
     assert_eq!(
-        client.try_set_protocol_fee(&admin, &treasury, &1000u32),
+        client.try_set_protocol_fee(&admin, &treasury, &300u32),
         Ok(Ok(()))
     );
 }

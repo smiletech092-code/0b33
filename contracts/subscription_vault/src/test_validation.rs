@@ -6,7 +6,7 @@
 
 use crate::{
     types::Error,
-    validation::{reject_contract_self, reject_empty_string},
+    validation::{reject_contract_self, reject_empty_string, reject_zero_interval},
     SubscriptionVault,
 };
 use soroban_sdk::{Env, String};
@@ -90,4 +90,25 @@ fn test_reject_contract_self_accepts_other_address() {
     env.as_contract(&contract_id, || {
         assert_eq!(reject_contract_self(&env, &other_id), Ok(()));
     });
+}
+
+// ── reject_zero_interval ─────────────────────────────────────────────────────
+
+#[test]
+fn test_reject_zero_interval_rejects_zero() {
+    // interval_seconds == 0 must return InvalidInput (error code 3002).
+    assert_eq!(
+        reject_zero_interval(0),
+        Err(Error::InvalidInput),
+        "interval_seconds of zero must be rejected with InvalidInput"
+    );
+}
+
+#[test]
+fn test_reject_zero_interval_accepts_nonzero() {
+    // Any positive value is accepted by this guard (range bounds are
+    // enforced separately by validate_interval in subscription.rs).
+    assert_eq!(reject_zero_interval(1), Ok(()));
+    assert_eq!(reject_zero_interval(60), Ok(()));
+    assert_eq!(reject_zero_interval(86_400), Ok(()));
 }

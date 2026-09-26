@@ -4,11 +4,19 @@
 //!
 //! 1. **Merchant** calls `create_coupon` → stored under `DataKey::Coupon(code)`.
 //! 2. **Subscriber** calls `apply_coupon` → binds code to subscription via
-//!    `DataKey::SubCoupon(subscription_id)`; increments `DataKey::CouponRedemptions(code)`.
+//!    `DataKey::SubCoupon(subscription_id)`; marks redemption via
+//!    `DataKey::SubCouponRedeemed(subscription_id, code)`; increments
+//!    `DataKey::CouponRedemptions(code)`.
 //! 3. `charge_one` calls `resolve_coupon_for_charge` / `validate_coupon_for_charge` /
 //!    `compute_discount` to apply the discount before fee splitting.
 //! 4. **Merchant** may call `revoke_coupon` at any time. Already-bound coupons that have
 //!    been revoked are skipped silently at charge time (to avoid billing outages).
+//!
+//! # Per-Subscription Redemption
+//!
+//! Once a coupon is applied to a specific subscription, it cannot be reapplied to that same
+//! subscription. A second attempt to apply the same coupon to the same subscription returns
+//! the `Replay` error (code 4005).
 //!
 //! # Discount Ordering
 //!
@@ -24,13 +32,14 @@
 //!
 //! # Storage
 //!
-//! All three keys are **persistent** and get TTL extended on every write:
+//! All keys are **persistent** and get TTL extended on every write:
 //!
 //! | Key | Type | Purpose |
 //! |---|---|---|
 //! | `DataKey::Coupon(code)` | `Coupon` | Coupon record |
 //! | `DataKey::CouponRedemptions(code)` | `u32` | Global bind count |
 //! | `DataKey::SubCoupon(subscription_id)` | `Symbol` | Subscription → coupon code |
+//! | `DataKey::SubCouponRedeemed(subscription_id, code)` | `bool` | Per-subscription redemption flag |
 
 #![allow(dead_code)]
 
@@ -69,6 +78,18 @@ fn write_redemptions(env: &Env, code: &Symbol, count: u32) {
     crate::subscription::maybe_extend_ttl(env, &key, SUB_TTL_THRESHOLD, SUB_TTL_EXTEND_TO);
 }
 
+fn is_coupon_redeemed(env: &Env, subscription_id: u32, code: &Symbol) -> bool {
+    env.storage()
+        .persistent()
+        .has(&DataKey::SubCouponRedeemed(subscription_id, code.clone()))
+}
+
+fn mark_coupon_redeemed(env: &Env, subscription_id: u32, code: &Symbol) {
+    let key = DataKey::SubCouponRedeemed(subscription_id, code.clone());
+    env.storage().persistent().set(&key, &true);
+    crate::subscription::maybe_extend_ttl(env, &key, SUB_TTL_THRESHOLD, SUB_TTL_EXTEND_TO);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,8 +116,8 @@ pub fn create_coupon(
     if percent_off_bps > 10_000 {
         return Err(Error::InvalidInput);
     }
-    if fixed_off < 0 {
-        return Err(Error::InvalidInput);
+    if fixed_off <= 0 {
+        return Err(Error::InvalidAmount);
     }
     let now = env.ledger().timestamp();
     if expires_at > 0 && expires_at <= now {
@@ -172,6 +193,8 @@ pub fn revoke_coupon(env: &Env, merchant: Address, code: Symbol) -> Result<(), E
 ///
 /// Increments the global redemption counter at bind time. A subscription can
 /// hold at most one coupon (`CouponAlreadyApplied` if already bound).
+/// Once a coupon has been applied to a subscription, it cannot be reapplied
+/// (`Replay` error on second attempt).
 pub fn apply_coupon(
     env: &Env,
     subscriber: Address,
@@ -184,6 +207,11 @@ pub fn apply_coupon(
     let sub = crate::queries::get_subscription(env, subscription_id)?;
     if sub.subscriber != subscriber {
         return Err(Error::Unauthorized);
+    }
+
+    // Check if this specific (subscription_id, code) pair has already been redeemed.
+    if is_coupon_redeemed(env, subscription_id, &code) {
+        return Err(Error::Replay);
     }
 
     // One coupon per subscription.
@@ -227,6 +255,9 @@ pub fn apply_coupon(
         SUB_TTL_THRESHOLD,
         SUB_TTL_EXTEND_TO,
     );
+
+    // Mark this (subscription_id, code) pair as redeemed.
+    mark_coupon_redeemed(env, subscription_id, &code);
 
     // Increment global redemption counter.
     increment_redemptions(env, &code);

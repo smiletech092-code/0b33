@@ -224,7 +224,7 @@ fn setup(charge_budget: u32) -> Harness {
         &None::<soroban_sdk::Symbol>,
     );
 
-    client.deposit_funds(&sub_id, &subscriber, &funding, &None::<soroban_sdk::BytesN<32>>);
+    client.deposit_funds(&sub_id, &funding, &None::<soroban_sdk::BytesN<32>>);
 
     Harness {
         env,

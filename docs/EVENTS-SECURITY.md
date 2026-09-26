@@ -306,7 +306,142 @@ All 30+ events defined with stable schemas. Extensions are backward compatible:
 
 ## Recommendations for Indexers
 
-### 1. Store Events Persistently
+### 1. Cryptographic Event Verification (Off-Chain Event Injection Protection)
+
+**Problem:** An off-chain indexer database could be compromised or an attacker could
+inject fake events into the indexer's event stream. Indexers that blindly trust
+events without verification could serve fraudulent data to applications.
+
+**Solution:** Verify event provenance using Stellar's on-chain record:
+
+#### Step 1: Verify Transaction Hash and Ledger
+
+```
+For each event from the indexer:
+  1. Extract the transaction ID from event metadata
+  2. Query Horizon API: GET /transactions/{tx_hash}
+  3. Verify the transaction:
+     - Result status == "success"
+     - Source account matches expected contract
+     - Ledger sequence is within acceptable range
+  4. If verification fails, mark event as suspect
+```
+
+#### Step 2: Verify Event Emission from Contract
+
+```
+For each SubscriptionChargedEvent:
+  1. Query Horizon: GET /transactions/{tx_hash}/operations
+  2. Verify InvokeContractOperation:
+     - Contract address matches subscription_vault
+     - Function name matches "charge_subscription" or "charge_usage"
+  3. Retrieve contract ledger state at that ledger sequence:
+     - Query last_payment_timestamp for the subscription
+     - Confirm it matches the event's expected post-charge state
+  4. If state mismatch, event is fraudulent
+```
+
+#### Step 3: Reconstruct State and Verify Invariants
+
+```
+Reconstruct subscription state from events:
+  balance = sum(deposits) - sum(charges) - sum(refunds)
+  
+Verify invariants:
+  - balance >= 0 (no negative balance)
+  - lifetime_charged >= 0
+  - fee_amount + merchant_amount == gross_charge
+  - last_payment_timestamp is monotonically increasing
+  
+If any invariant fails, event stream is corrupted
+```
+
+#### Example: Horizon API Verification Flow
+
+```javascript
+// Verify a charge event
+async function verifyChargeEvent(event, horizonApiUrl) {
+  // 1. Get transaction
+  const txResponse = await fetch(
+    `${horizonApiUrl}/transactions/${event.tx_hash}`
+  );
+  const tx = await txResponse.json();
+  
+  if (tx.result_code !== 0) {
+    return { valid: false, reason: "tx_failed" };
+  }
+  
+  // 2. Verify operation targets correct contract
+  const operationsResponse = await fetch(
+    `${horizonApiUrl}/transactions/${event.tx_hash}/operations`
+  );
+  const operations = await operationsResponse.json();
+  
+  const contractOp = operations.records.find(op => 
+    op.type === "invoke_contract" &&
+    op.contract === SUBSCRIPTION_VAULT_ADDRESS
+  );
+  
+  if (!contractOp) {
+    return { valid: false, reason: "no_contract_invocation" };
+  }
+  
+  // 3. Query ledger state at charge time
+  const ledgerResponse = await fetch(
+    `${horizonApiUrl}/ledgers/${tx.ledger_attr}`
+  );
+  const ledger = await ledgerResponse.json();
+  
+  // 4. Verify event amount matches state change
+  const expectedStateChange = {
+    subscriber_balance_decreased: event.amount,
+    merchant_balance_increased: event.merchant_amount,
+  };
+  
+  return { valid: true, ledger_verified: true };
+}
+```
+
+#### Best Practice: Event Verification Chain
+
+```
+Untrusted indexer → Horizon verification → Trusted state cache
+     ↓
+  Fetch events from indexer
+     ↓
+  For each event, call verifyChargeEvent()
+     ↓
+  If valid: use in state reconstruction
+  If invalid: log alert and skip
+     ↓
+  Store verified state in cache
+```
+
+### 2. Ledger Hash Verification
+
+For high-security integrations, verify using ledger hashes:
+
+```
+1. Query Horizon: GET /ledgers/{ledger_sequence}
+2. Retrieve ledger_hash from response
+3. Cryptographically verify against local ledger header
+4. This ensures no ledger tampering occurred
+```
+
+### 3. Reference Implementation Indexer
+
+The reference indexer implementation (if provided in this project) should:
+
+- Fetch events only from Horizon API (official Stellar service)
+- Verify each event's transaction with Horizon before storing
+- Maintain an immutable event log in a secure database
+- Expose a verification API so clients can verify provenance
+
+---
+
+## Old Recommendations (Kept for Context)
+
+### Store Events Persistently
 Use time-series database (e.g., ClickHouse, TimescaleDB):
 ```sql
 CREATE TABLE subscription_vault_events (
@@ -322,7 +457,7 @@ CREATE TABLE subscription_vault_events (
 ) ENGINE = MergeTree() ORDER BY (timestamp, block_height);
 ```
 
-### 2. Derive Balances from Events
+### Derive Balances from Events
 Never trust on-chain balance query alone:
 ```
 balance = ∑(FundsDepositedEvent.amount) 
@@ -330,7 +465,7 @@ balance = ∑(FundsDepositedEvent.amount)
         - ∑(PartialRefundEvent.amount)
 ```
 
-### 3. Validate Amounts
+### Validate Amounts
 Check invariants:
 ```
 For each charge event:
@@ -340,7 +475,7 @@ For each withdrawal:
   MerchantWithdrawalEvent.amount + remaining_balance == prior_balance
 ```
 
-### 4. Monitor for Gaps
+### Monitor for Gaps
 Alert if events are missing:
 ```
 If (SubscriptionChargedEvent received) AND (no prior FundsDepositedEvent):

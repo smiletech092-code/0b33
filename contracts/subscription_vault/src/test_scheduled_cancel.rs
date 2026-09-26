@@ -55,7 +55,7 @@ fn create_active_sub(
         &None::<u64>,
         &None::<u32>,
 );
-    client.deposit_funds(&id, &subscriber, &PREPAID, &None);
+    client.deposit_funds(&id, &PREPAID, &None);
     (id, subscriber, merchant, client.get_subscription(&id).token)
 }
 

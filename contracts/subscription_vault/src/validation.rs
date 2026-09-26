@@ -76,6 +76,23 @@ pub fn reject_empty_string(s: &String) -> Result<(), Error> {
     Ok(())
 }
 
+/// Reject a zero `interval_seconds` value.
+///
+/// A zero interval would allow a subscription to be charged on every ledger
+/// tick, effectively making it infinitely chargeable. This guard is the
+/// authoritative gate for the zero case; the broader range check
+/// (`validate_interval` in `subscription.rs`) calls this function first.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidInput`] (code 3002) when `interval_seconds == 0`.
+pub fn reject_zero_interval(interval_seconds: u64) -> Result<(), Error> {
+    if interval_seconds == 0 {
+        return Err(Error::InvalidInput);
+    }
+    Ok(())
+}
+
 /// Reject an `Address` that equals the current contract's own address.
 ///
 /// Passing the contract's own address as a party (merchant, treasury,

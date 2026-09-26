@@ -157,7 +157,7 @@ fn create_and_fund_sub(
     let token_admin = token::StellarAssetClient::new(env, token);
     token_admin.mint(subscriber, &DEPOSIT);
     let no_key: Option<BytesN<32>> = None;
-    client.deposit_funds(&sub_id, subscriber, &DEPOSIT, &no_key);
+    client.deposit_funds(&sub_id, &DEPOSIT, &no_key);
 
     sub_id
 }
@@ -473,7 +473,7 @@ fn bench_charge_cold_vs_warm_grace_period() {
     let token_admin_cold = token::StellarAssetClient::new(&env_cold, &token_cold);
     token_admin_cold.mint(&subscriber, &DEPOSIT);
     let no_key: Option<BytesN<32>> = None;
-    client_cold.deposit_funds(&sub_id_cold, &subscriber, &DEPOSIT, &no_key);
+    client_cold.deposit_funds(&sub_id_cold, &DEPOSIT, &no_key);
 
     let cold_metrics = measure_cold_charge(&env_cold, &client_cold, sub_id_cold);
 
@@ -505,7 +505,7 @@ fn bench_charge_cold_vs_warm_grace_period() {
 
     let token_admin_warm = token::StellarAssetClient::new(&env_warm, &token_warm);
     token_admin_warm.mint(&subscriber_warm, &DEPOSIT);
-    client_warm.deposit_funds(&sub_id_warm, &subscriber_warm, &DEPOSIT, &no_key);
+    client_warm.deposit_funds(&sub_id_warm, &DEPOSIT, &no_key);
 
     let warm_metrics = measure_warm_charge(&env_warm, &client_warm, sub_id_warm);
 

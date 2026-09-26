@@ -342,7 +342,7 @@ fn test_charge_with_discount() {
 
     client
         .mock_all_auths()
-        .set_protocol_fee(&admin, &treasury, &1000); // 10% fee
+        .set_protocol_fee(&admin, &treasury, &500); // 5% fee
 
     // 50% discount
     client
@@ -545,6 +545,34 @@ fn coupon_creation_rejects_expiry_at_current_time() {
 }
 
 #[test]
+fn coupon_creation_rejects_zero_fixed_off() {
+    let (env, client, _admin, token) = setup();
+    let merchant = Address::generate(&env);
+    let code = Symbol::new(&env, "ZERO_FIXED");
+
+    let result = client.try_create_coupon(&merchant, &code, &token, &0, &0, &0, &0);
+
+    assert_eq!(
+        result.err().unwrap().unwrap().to_code(),
+        Error::InvalidAmount.to_code()
+    );
+}
+
+#[test]
+fn coupon_creation_rejects_negative_fixed_off() {
+    let (env, client, _admin, token) = setup();
+    let merchant = Address::generate(&env);
+    let code = Symbol::new(&env, "NEG_FIXED");
+
+    let result = client.try_create_coupon(&merchant, &code, &token, &0, &-100, &0, &0);
+
+    assert_eq!(
+        result.err().unwrap().unwrap().to_code(),
+        Error::InvalidAmount.to_code()
+    );
+}
+
+#[test]
 fn multiple_redemption_attempts_in_same_block() {
     let (env, client, _admin, token) = setup();
     let merchant = Address::generate(&env);
@@ -619,4 +647,44 @@ fn expired_coupon_cannot_be_redeemed_after_repeated_attempts() {
     // Verify coupon is still not applied
     let coupon = client.get_coupon(&code).unwrap();
     assert_eq!(coupon.expires_at, expires_at);
+}
+
+#[test]
+fn test_apply_coupon_second_attempt_fails_with_replay() {
+    let (env, client, _admin, token) = setup();
+    let merchant = Address::generate(&env);
+    let subscriber = Address::generate(&env);
+    let code = Symbol::new(&env, "SINGLE_USE");
+
+    client
+        .mock_all_auths()
+        .create_coupon(&merchant, &code, &token, &5000, &0, &0, &0);
+
+    let sub_id = client
+        .mock_all_auths()
+        .create_subscription(&subscriber, &merchant, &1000, &86400, &false, &None::<i128>, &None::<u64>, &None::<Address>);
+
+    // First application succeeds
+    let result1 = client.try_apply_coupon(&subscriber, &sub_id, &code);
+    assert!(result1.is_ok(), "First coupon application should succeed");
+
+    // Verify coupon was bound to the subscription
+    let coupon = client.get_coupon(&code).unwrap();
+    assert_eq!(coupon.code, code);
+
+    // Second attempt to apply the same coupon to the same subscription must fail with Replay error
+    let result2 = client.try_apply_coupon(&subscriber, &sub_id, &code);
+    assert_eq!(
+        result2.err().unwrap().unwrap().to_code(),
+        Error::Replay.to_code(),
+        "Second application of the same coupon to the same subscription should return Replay error (4005)"
+    );
+
+    // Third attempt also fails with Replay
+    let result3 = client.try_apply_coupon(&subscriber, &sub_id, &code);
+    assert_eq!(
+        result3.err().unwrap().unwrap().to_code(),
+        Error::Replay.to_code(),
+        "Third application should also return Replay error"
+    );
 }

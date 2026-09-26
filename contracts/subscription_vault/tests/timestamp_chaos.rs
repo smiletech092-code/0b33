@@ -164,7 +164,7 @@ impl ChaosEnv {
             &None::<u64>,  // expires_at
                 &None::<u32>,
 );
-        self.client.deposit_funds(&id, &subscriber, &PREPAID, &None);
+        self.client.deposit_funds(&id, &PREPAID, &None);
         (id, subscriber, merchant)
     }
 }
@@ -319,7 +319,7 @@ fn test_backward_jump_across_grace_boundary_no_panic() {
         &None::<u64>,
         &None::<u32>,
 );
-    ce.client.deposit_funds(&id, &subscriber, &AMOUNT, &None);
+    ce.client.deposit_funds(&id, &AMOUNT, &None);
 
     // First charge — exhausts the prepaid balance
     ce.set_ts(T0 + INTERVAL);
@@ -368,8 +368,7 @@ fn test_chaos_200_random_timestamp_jumps() {
 
     // Deposit extra so balance is sufficient for many charges
     ce.mint(&subscriber, PREPAID * 50);
-    ce.client
-        .deposit_funds(&id, &subscriber, &(PREPAID * 20), &None);
+    ce.client.deposit_funds(&id, &(PREPAID * 20), &None);
 
     let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_1337;
     let mut anchor = T0;
@@ -427,8 +426,7 @@ fn test_monotonic_forward_sequence_all_charges_succeed() {
     let (id, subscriber, _) = ce.create_funded_subscription();
 
     ce.mint(&subscriber, PREPAID * 20);
-    ce.client
-        .deposit_funds(&id, &subscriber, &(PREPAID * 10), &None);
+    ce.client.deposit_funds(&id, &(PREPAID * 10), &None);
 
     let mut current = T0;
 
@@ -460,8 +458,7 @@ fn test_backward_jump_then_forward_recovery() {
     ce.set_ts(T0);
     let (id, subscriber, _) = ce.create_funded_subscription();
     ce.mint(&subscriber, PREPAID * 5);
-    ce.client
-        .deposit_funds(&id, &subscriber, &(PREPAID * 2), &None);
+    ce.client.deposit_funds(&id, &(PREPAID * 2), &None);
 
     // First charge succeeds
     let first_charge_ts = T0 + INTERVAL + 1;
@@ -594,8 +591,7 @@ fn test_period_index_saturates_to_zero_when_now_before_start() {
     ce.set_ts(T0);
     let (id, subscriber, _) = ce.create_funded_subscription();
     ce.mint(&subscriber, PREPAID * 3);
-    ce.client
-        .deposit_funds(&id, &subscriber, &(PREPAID * 2), &None);
+    ce.client.deposit_funds(&id, &(PREPAID * 2), &None);
 
     // Record subscription start
     let sub_start = ce.client.get_subscription(&id).start_time;

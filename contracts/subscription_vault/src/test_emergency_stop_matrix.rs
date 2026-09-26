@@ -47,7 +47,7 @@ fn test_emergency_stop_matrix_blocks_mutations_but_allows_reads() {
         &None::<u64>,
         &None::<u32>,
 );
-    client.deposit_funds(&sub_id, &subscriber, &10_000_000i128, &None::<soroban_sdk::BytesN<32>>);
+    client.deposit_funds(&sub_id, &10_000_000i128, &None::<soroban_sdk::BytesN<32>>);
 
     let plan_id = client.create_plan_template(&merchant, &1_000_000i128, &INTERVAL, &false, &None::<i128>);
 
@@ -85,7 +85,7 @@ fn test_emergency_stop_matrix_blocks_mutations_but_allows_reads() {
         Err(Ok(Error::EmergencyStopActive))
     );
     assert_eq!(client.try_create_subscription_from_plan(&subscriber, &plan_id), Err(Ok(Error::EmergencyStopActive)));
-    assert_eq!(client.try_deposit_funds(&sub_id, &subscriber, &1_000_000i128, &None::<soroban_sdk::BytesN<32>>), Err(Ok(Error::EmergencyStopActive)));
+    assert_eq!(client.try_deposit_funds(&sub_id, &1_000_000i128, &None::<soroban_sdk::BytesN<32>>), Err(Ok(Error::EmergencyStopActive)));
 
     assert_eq!(client.try_charge_subscription(&sub_id, &None::<soroban_sdk::BytesN<32>>), Err(Ok(Error::EmergencyStopActive)));
     assert_eq!(client.try_charge_usage(&sub_id, &100_000i128), Err(Ok(Error::EmergencyStopActive)));
@@ -129,7 +129,7 @@ fn test_emergency_stop_recovery_and_edge_cases() {
     // Initial setup
     soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&subscriber, &DEPOSIT);
     let sub_id = client.create_subscription(&subscriber, &merchant, &1_000_000i128, &INTERVAL, &true, &None::<i128>, &None::<u64>);
-    client.deposit_funds(&sub_id, &subscriber, &10_000_000i128, &None::<soroban_sdk::BytesN<32>>);
+    client.deposit_funds(&sub_id, &10_000_000i128, &None::<soroban_sdk::BytesN<32>>);
     let plan_id = client.create_plan_template(&merchant, &1_000_000i128, &INTERVAL, &false, &None::<i128>);
     client.set_operator(&admin, &operator);
 
@@ -141,7 +141,7 @@ fn test_emergency_stop_recovery_and_edge_cases() {
     assert_eq!(client.try_create_subscription(&subscriber, &merchant, &1_000_000i128, &INTERVAL, &false, &None::<i128>, &None::<u64>), Err(Ok(Error::EmergencyStopActive)));
     assert_eq!(client.try_create_subscription_with_token(&subscriber, &merchant, &token, &1_000_000i128, &INTERVAL, &false, &None::<i128>, &None::<u64>), Err(Ok(Error::EmergencyStopActive)));
     assert_eq!(client.try_create_subscription_from_plan(&subscriber, &plan_id), Err(Ok(Error::EmergencyStopActive)));
-    assert_eq!(client.try_deposit_funds(&sub_id, &subscriber, &1_000_000i128, &None::<soroban_sdk::BytesN<32>>), Err(Ok(Error::EmergencyStopActive)));
+    assert_eq!(client.try_deposit_funds(&sub_id, &1_000_000i128, &None::<soroban_sdk::BytesN<32>>), Err(Ok(Error::EmergencyStopActive)));
     assert_eq!(client.try_charge_subscription(&sub_id, &None::<soroban_sdk::BytesN<32>>), Err(Ok(Error::EmergencyStopActive)));
     assert_eq!(client.try_charge_usage(&sub_id, &100_000i128), Err(Ok(Error::EmergencyStopActive)));
     assert_eq!(client.try_charge_usage_with_reference(&sub_id, &100_000i128, &String::from_str(&env, "usage-ref")), Err(Ok(Error::EmergencyStopActive)));
@@ -160,7 +160,7 @@ fn test_emergency_stop_recovery_and_edge_cases() {
     // After disabling, mutations should succeed
     assert!(client.try_create_subscription(&subscriber, &merchant, &1_000_000i128, &INTERVAL, &false, &None::<i128>, &None::<u64>).is_ok());
     assert!(client.try_create_subscription_with_token(&subscriber, &merchant, &token, &1_000_000i128, &INTERVAL, &false, &None::<i128>, &None::<u64>).is_ok());
-    assert!(client.try_deposit_funds(&sub_id, &subscriber, &1_000_000i128, &None::<soroban_sdk::BytesN<32>>).is_ok());
+    assert!(client.try_deposit_funds(&sub_id, &1_000_000i128, &None::<soroban_sdk::BytesN<32>>).is_ok());
     assert!(client.try_charge_subscription(&sub_id, &None::<soroban_sdk::BytesN<32>>).is_ok());
     assert!(client.try_charge_usage(&sub_id, &100_000i128).is_ok());
     assert!(client.try_charge_usage_with_reference(&sub_id, &100_000i128, &String::from_str(&env, "usage-ref")).is_ok());

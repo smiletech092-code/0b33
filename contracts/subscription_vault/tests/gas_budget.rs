@@ -204,7 +204,7 @@ fn budget_deposit_funds() {
     );
 
     env.cost_estimate().budget().reset_unlimited();
-    vault.deposit_funds(&sub_id, &subscriber, &50_000i128, &None);
+    vault.deposit_funds(&sub_id, &50_000i128, &None);
 
     let resources = env.cost_estimate().resources();
     let cpu = resources.instructions.max(0) as u64;
@@ -245,7 +245,7 @@ fn budget_charge_subscription() {
         &None,
         &None::<Address>,
     );
-    vault.deposit_funds(&sub_id, &subscriber, &50_000i128, &None);
+    vault.deposit_funds(&sub_id, &50_000i128, &None);
     env.ledger().set_timestamp(1_000_000 + 30 * 86_400 + 1);
 
     env.cost_estimate().budget().reset_unlimited();
@@ -286,7 +286,7 @@ fn budget_withdraw_merchant_funds() {
         &None,
         &None::<Address>,
     );
-    vault.deposit_funds(&sub_id, &subscriber, &50_000i128, &None);
+    vault.deposit_funds(&sub_id, &50_000i128, &None);
     env.ledger().set_timestamp(1_000_000 + 30 * 86_400 + 1);
     vault.charge_subscription(&sub_id, &None);
     init_merchant(&vault, &merchant);
@@ -345,7 +345,7 @@ fn budget_charge_subscription_high_id() {
             &None,
             &None::<Address>,
         );
-        vault.deposit_funds(&last_id, &subscriber, &50_000i128, &None);
+        vault.deposit_funds(&last_id, &50_000i128, &None);
     }
 
     env.ledger().set_timestamp(1_000_000 + 30 * 86_400 + 1);
@@ -393,7 +393,7 @@ fn budget_withdraw_dense_merchant_earnings() {
             &None,
             &None::<Address>,
         );
-        vault.deposit_funds(&sub_id, &subscriber, &50_000i128, &None);
+        vault.deposit_funds(&sub_id, &50_000i128, &None);
     }
 
     env.ledger().set_timestamp(1_000_000 + 30 * 86_400 + 1);

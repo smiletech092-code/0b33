@@ -919,6 +919,255 @@ mod vote_lock_during_timelock {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// Minimum timelock delay enforcement — proposal execution safety
+//
+// Verifies that proposals cannot be executed until at least MIN_TIMELOCK_DELAY
+// (2 days) has elapsed since creation, even if quorum is met earlier.
+// This prevents same-ledger execution and ensures a minimum review window.
+// ══════════════════════════════════════════════════════════════════════════════
+
+mod min_timelock_delay_enforcement {
+    use crate::types::Error;
+    use crate::{SubscriptionVault, SubscriptionVaultClient};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Address, Env, String,
+    };
+
+    // MIN_TIMELOCK_DELAY = 2 days = 172800 seconds (from governance.rs)
+    const MIN_TIMELOCK_DELAY: u64 = 2 * 24 * 60 * 60;
+
+    /// Helper to initialize contract
+    fn init_vault<'a>(env: &'a Env, admin: &Address) -> SubscriptionVaultClient<'a> {
+        let token_admin = Address::generate(env);
+        let token_address = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+
+        let contract_id = env.register(SubscriptionVault, ());
+        let client = SubscriptionVaultClient::new(env, &contract_id);
+
+        client.init(
+            &token_address,
+            &6,       // decimals
+            admin,
+            &10_000_000, // min_topup
+            &86400,      // grace period
+        );
+
+        client
+    }
+
+    /// Test: submission with ETA < now + MIN_TIMELOCK_DELAY is rejected.
+    #[test]
+    fn submit_with_insufficient_delay_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let client = init_vault(&env, &admin);
+        let target = Address::generate(&env);
+
+        let current_time = env.ledger().timestamp();
+        // Try to set ETA to less than 2 days in the future
+        let too_soon_eta = current_time + 1000; // Only ~16 minutes
+
+        let result = client.try_submit_proposal(
+            &crate::types::ProposalKind::RotateAdmin,
+            &target,
+            &None,
+            &0,
+            &5000, // quorum_bps
+            &too_soon_eta,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidInput)),
+            "proposal with insufficient delay must be rejected"
+        );
+    }
+
+    /// Test: submission with ETA >= now + MIN_TIMELOCK_DELAY is accepted.
+    #[test]
+    fn submit_with_sufficient_delay_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let client = init_vault(&env, &admin);
+        let target = Address::generate(&env);
+
+        let current_time = env.ledger().timestamp();
+        // Set ETA to exactly 2 days in the future
+        let good_eta = current_time + MIN_TIMELOCK_DELAY;
+
+        let result = client.try_submit_proposal(
+            &crate::types::ProposalKind::RotateAdmin,
+            &target,
+            &None,
+            &0,
+            &5000,
+            &good_eta,
+        );
+
+        assert!(
+            result.is_ok(),
+            "proposal with sufficient delay must be accepted"
+        );
+    }
+
+    /// Test: execution before MIN_TIMELOCK_DELAY is rejected.
+    #[test]
+    fn execute_before_min_delay_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        let client = init_vault(&env, &admin);
+        client.add_guardian(&admin, &guardian, &100);
+
+        let current_time = env.ledger().timestamp();
+        // Set ETA to far in future so it passes the ETA check
+        let eta = current_time + MIN_TIMELOCK_DELAY + 1000;
+
+        let proposal_id = client.submit_proposal(
+            &crate::types::ProposalKind::RotateAdmin,
+            &Address::generate(&env),
+            &None,
+            &0,
+            &5000,
+            &eta,
+        );
+
+        // Vote to reach quorum
+        client.vote_proposal(&proposal_id, &true);
+
+        // Advance time to past ETA but only 1 day (< MIN_TIMELOCK_DELAY)
+        env.ledger().set_timestamp(current_time + 86400);
+
+        // Try to execute — must fail because MIN_TIMELOCK_DELAY hasn't elapsed
+        let result = client.try_execute_proposal(&proposal_id);
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidInput)),
+            "execution before MIN_TIMELOCK_DELAY must be rejected"
+        );
+    }
+
+    /// Test: execution after MIN_TIMELOCK_DELAY succeeds (if quorum met and ETA passed).
+    #[test]
+    fn execute_after_min_delay_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        let client = init_vault(&env, &admin);
+        client.add_guardian(&admin, &guardian, &100);
+
+        let current_time = env.ledger().timestamp();
+        let eta = current_time + MIN_TIMELOCK_DELAY;
+
+        let new_admin = Address::generate(&env);
+        let proposal_id = client.submit_proposal(
+            &crate::types::ProposalKind::RotateAdmin,
+            &new_admin,
+            &None,
+            &0,
+            &5000,
+            &eta,
+        );
+
+        // Vote to reach quorum
+        client.vote_proposal(&proposal_id, &true);
+
+        // Advance to exactly MIN_TIMELOCK_DELAY + 1 second
+        env.ledger()
+            .set_timestamp(current_time + MIN_TIMELOCK_DELAY + 1);
+
+        // Execution must succeed
+        let result = client.try_execute_proposal(&proposal_id);
+        assert!(
+            result.is_ok(),
+            "execution after MIN_TIMELOCK_DELAY must succeed"
+        );
+
+        // Verify admin was actually rotated
+        assert_eq!(client.get_admin(), new_admin);
+    }
+
+    /// Test: multiple proposals at different times enforce independent delays.
+    #[test]
+    fn multiple_proposals_independent_delays() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        let client = init_vault(&env, &admin);
+        client.add_guardian(&admin, &guardian, &100);
+
+        let t0 = env.ledger().timestamp();
+
+        // Proposal A at t0
+        let eta_a = t0 + MIN_TIMELOCK_DELAY;
+        let admin_a = Address::generate(&env);
+        let proposal_a = client.submit_proposal(
+            &crate::types::ProposalKind::RotateAdmin,
+            &admin_a,
+            &None,
+            &0,
+            &5000,
+            &eta_a,
+        );
+        client.vote_proposal(&proposal_a, &true);
+
+        // Advance 1 day
+        let t1 = t0 + 86400;
+        env.ledger().set_timestamp(t1);
+
+        // Proposal B at t1 (requires MIN_TIMELOCK_DELAY from t1, not t0)
+        let eta_b = t1 + MIN_TIMELOCK_DELAY;
+        let admin_b = Address::generate(&env);
+        let proposal_b = client.submit_proposal(
+            &crate::types::ProposalKind::RotateAdmin,
+            &admin_b,
+            &None,
+            &0,
+            &5000,
+            &eta_b,
+        );
+        client.vote_proposal(&proposal_b, &true);
+
+        // At time t0 + MIN_TIMELOCK_DELAY: A can execute, B cannot
+        env.ledger().set_timestamp(t0 + MIN_TIMELOCK_DELAY + 1);
+
+        let a_result = client.try_execute_proposal(&proposal_a);
+        assert!(a_result.is_ok(), "proposal A should execute");
+
+        let b_result = client.try_execute_proposal(&proposal_b);
+        assert_eq!(
+            b_result,
+            Err(Ok(Error::InvalidInput)),
+            "proposal B should be rejected (MIN_TIMELOCK_DELAY not reached)"
+        );
+
+        // At time t1 + MIN_TIMELOCK_DELAY: B can execute
+        env.ledger().set_timestamp(t1 + MIN_TIMELOCK_DELAY + 1);
+
+        // Re-initialize for second proposal since first admin changed
+        let guardian2 = Address::generate(&env);
+        let admin_a_now = client.get_admin();
+        client.add_guardian(&admin_a_now, &guardian2, &100);
+
+        let b_result = client.try_execute_proposal(&proposal_b);
+        assert!(b_result.is_ok(), "proposal B should execute at its time");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // Admin rotation invariant tests
 //
 // Security model enforced by these tests:

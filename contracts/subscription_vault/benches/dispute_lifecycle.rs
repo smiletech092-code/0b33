@@ -167,7 +167,7 @@ fn setup_merchant_and_sub(
     let token_admin = token::StellarAssetClient::new(env, &client.get_subscription(&sub_id).token);
     token_admin.mint(&subscriber, &DEPOSIT);
     let no_key: Option<BytesN<32>> = None;
-    client.deposit_funds(&sub_id, &subscriber, &DEPOSIT, &no_key);
+    client.deposit_funds(&sub_id, &DEPOSIT, &no_key);
 
     let token = client.get_subscription(&sub_id).token;
     (subscriber, merchant, sub_id, token)

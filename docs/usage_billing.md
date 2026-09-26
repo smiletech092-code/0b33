@@ -74,6 +74,71 @@ Both draw from the same `prepaid_balance`. If either charge drains the balance
 to zero, the subscription moves to `InsufficientBalance`, blocking the other
 charge type as well until the subscriber tops up.
 
+## Concurrent Usage Charge Requests
+
+If two `charge_usage` calls for the same subscription ID are submitted
+simultaneously (e.g., from parallel billing workers or within the same batch),
+the outcome depends on the **reference-based idempotency key**:
+
+### Reference-Based Replay Protection
+
+Each usage charge request **must include a unique `reference` string** that
+serves as an idempotency key. The contract enforces:
+
+- **First request** with reference `ref_A` → Charge succeeds, reference stored
+- **Duplicate request** with same reference `ref_A` → Returns `UsageChargeResult::Replay`
+  (idempotent; no charge executed)
+- **New request** with different reference `ref_B` → Charge succeeds if balance available
+
+**Thread safety guarantee:** The reference uniqueness check is atomic. Two concurrent
+requests with the **same reference** will deterministically have one succeed and
+one fail (no double-charge).
+
+### Example: Parallel Billing Workers
+
+```
+Worker 1: charge_usage(sub_id=42, usage_amount=100, reference="usage_20260925_batch_1_worker_a")
+Worker 2: charge_usage(sub_id=42, usage_amount=150, reference="usage_20260925_batch_1_worker_b")
+Result:   Both succeed independently (different references, different amounts)
+
+Worker 1: charge_usage(sub_id=42, usage_amount=100, reference="usage_20260925_batch_1_worker_a")
+Worker 1: charge_usage(sub_id=42, usage_amount=100, reference="usage_20260925_batch_1_worker_a") [retry]
+Result:   First succeeds with Charged, retry returns Replay
+```
+
+### Best Practices
+
+1. **Generate unique references per billing period/window:**
+   ```
+   reference = f"usage_{subscription_id}_{period_timestamp}_{worker_id}"
+   ```
+
+2. **Include worker or batch ID to distinguish parallel workers:**
+   ```
+   reference = f"billing_run_{batch_id}_{worker_id}_{sequence_number}"
+   ```
+
+3. **Treat `Replay` as success in idempotent contexts:**
+   ```
+   match charge_usage(id, amount, ref) {
+       UsageChargeResult::Charged => log("charge succeeded"),
+       UsageChargeResult::Replay => log("idempotent duplicate, ignoring"),
+       other => log("real error", other),
+   }
+   ```
+
+4. **Use subscription ID + timestamp + sequence as reference base:**
+   ```
+   reference = f"sub_{id}_ts_{now}_seq_{sequence}"
+   ```
+
+### Interval-Based Billing (Different Behavior)
+
+Interval-based charges use a different replay protection mechanism:
+- They track the **billing period index** (derived from elapsed time)
+- A charge cannot fire twice for the same period
+- No explicit reference is required (period index serves this purpose automatically)
+
 ## Integration Guide for Off-Chain Services
 
 1. **Create a subscription** with `usage_enabled = true`.
@@ -105,3 +170,25 @@ charge type as well until the subscriber tops up.
 | `UsageNotEnabled`          | 1004  | `usage_enabled` is `false` on subscription.  |
 | `InvalidAmount`            | 1006  | `usage_amount` ≤ 0.                          |
 | `InsufficientPrepaidBalance` | 1005 | Prepaid balance cannot cover the charge.     |
+
+## Testing Concurrent Usage Charges
+
+The test suite includes scenarios for concurrent usage charge handling:
+
+| Test | Scenario | Expected Outcome |
+|------|----------|------------------|
+| `test_concurrent_same_reference` | Two workers submit identical charge with same reference | First succeeds with `Charged`, second returns `Replay` |
+| `test_concurrent_different_references` | Two workers submit different references simultaneously | Both succeed if balance permits |
+| `test_concurrent_reference_uniqueness` | Verify reference atomicity across ledger ledgers | No double-charge on same reference |
+| `test_usage_after_insufficient_balance` | Concurrent charges that exhaust balance | First succeeds, second fails with `InsufficientPrepaidBalance` |
+| `test_reference_replay_idempotency` | Retry same reference multiple times | All retries after first return `Replay` |
+
+To run tests:
+
+```bash
+cargo test -p subscription_vault test_concurrent_usage
+```
+
+**Invariant maintained:** For any subscription and reference, at most one charge
+executes successfully. All subsequent calls with the same reference return
+`UsageChargeResult::Replay` without modifying state.

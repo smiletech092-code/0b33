@@ -12,6 +12,7 @@
 
 1. [Prerequisites](#prerequisites)
 2. [Step 1: Token Verification &amp; Validation](#step-1-token-verification--validation)
+   - [1.2 Verify token decimal precision (mandatory)](#12-verify-token-decimal-precision-mandatory)
 3. [Step 2: Admin Registration — `add_accepted_token`](#step-2-admin-registration--add_accepted_token)
 4. [Step 3: Oracle Price Feed Configuration (if applicable)](#step-3-oracle-price-feed-configuration-if-applicable)
 5. [Step 4: Plan Template Creation with New Token](#step-4-plan-template-creation-with-new-token)
@@ -32,10 +33,12 @@ Before beginning the onboarding checklist, ensure the following conditions are m
 - [ ] **Token contract is deployed on Stellar** — The asset contract (e.g., EURC,
       ARB, or a custom token) must be live and accessible at a valid Stellar
       address `G...`.
-- [ ] **Token decimals are known** — Record the exact `decimals` value the token
-      contract reports (e.g., EURC = 6, USDC = 7, native XLM = 7). This value
-      is **immutable** after registration and used for all future amount
-      normalisation.
+- [ ] **Token decimals verified on-chain** — Query the token contract's `decimals()`
+      function directly (see Step 1.2) and record the value it returns. Do **not**
+      rely on off-chain documentation or issuer announcements; use the value the
+      contract itself reports. This value is **immutable** after registration and
+      drives all amount normalisation — a mismatch causes every charge, deposit,
+      and withdrawal to be off by a power of ten.
 - [ ] **Admin key is available** — The current contract admin address (returned by
       `get_admin`) must be able to sign the transaction. Rotation must be
       completed **before** this step if the admin key is compromised or is
@@ -77,7 +80,78 @@ Confirm the token contract supports at least these standard functions:
 >   --source <ADMIN_KEY>
 > ```
 
-### 1.2 Check for non-standard behaviours
+### 1.2 Verify token decimal precision (mandatory)
+
+> **Why this step is mandatory:** The vault stores the `decimals` value supplied
+> to `add_accepted_token` and uses it permanently for every amount normalisation
+> thereafter. If the value you pass differs from what the token contract reports,
+> every charge, deposit, and withdrawal will be miscalculated by a factor of
+> 10^|difference|. For example, registering a 6-decimal token as 7 decimals causes
+> all amounts to be under-charged by **10×** with no on-chain safeguard to catch it.
+
+#### 1.2.1 Query `decimals()` on-chain
+
+Call the token contract directly — do not rely on off-chain documentation:
+
+```bash
+soroban contract invoke \
+  --id <TOKEN_CONTRACT_ID> \
+  --network <NETWORK> \
+  --fn decimals
+```
+
+Expected output for common tokens:
+
+| Token | Expected `decimals()` return value |
+|-------|------------------------------------|
+| USDC (Circle) | `7` |
+| EURC (Circle) | `6` |
+| Native XLM (wrapped) | `7` |
+| Custom token | Verify with issuer AND on-chain |
+
+- [ ] Record the returned value: `decimals = ___`
+
+#### 1.2.2 Cross-reference with the token's issuer documentation
+
+Confirm the on-chain value matches any off-chain specification:
+
+- [ ] On-chain `decimals()` return value matches issuer documentation.
+- [ ] If they differ, **stop**. Contact the token issuer to resolve the discrepancy
+      before proceeding. Do not register the token until the values agree.
+
+#### 1.2.3 Consequences of a mismatch
+
+If the wrong decimal value is passed to `add_accepted_token`, the following
+silent errors occur with **no on-chain error or revert**:
+
+| Registered as | Actual token | Effect on a 100-unit charge |
+|---------------|-------------|------------------------------|
+| 7 decimals | 6 decimals | Contract charges `100 × 10⁷ = 1 000 000 000` base units → **10× overcharge** |
+| 6 decimals | 7 decimals | Contract charges `100 × 10⁶ = 100 000 000` base units → **10× undercharge** |
+| Any mismatch | Any token | Normalised `normalized_*` fields in `TokenLiabilities` are wrong; reconciliation proofs are invalid |
+
+Because `decimals` is stored immutably under `TokenDecimals(token)` and is
+**never updated**, the only remediation is:
+
+1. Remove the incorrectly registered token with `remove_accepted_token(admin, token)`.
+2. Re-register it with the correct decimal value.
+3. Manually audit and reverse any charges made during the period of misconfiguration.
+
+> **There is no in-place correction path.** This makes pre-registration verification
+> the only safeguard.
+
+#### 1.2.4 Verify the vault's `InvalidTokenDecimals` guard
+
+The vault rejects `decimals == 0` and `decimals > 19` at registration time
+(error `InvalidTokenDecimals`, code 8001). All other values are accepted
+without further validation. The guard does **not** cross-check against the
+token contract's own `decimals()` — that is the operator's responsibility, and
+the purpose of this step.
+
+- [ ] Confirm `decimals` is between `1` and `19` inclusive.
+- [ ] Confirm the value matches `decimals()` queried in Step 1.2.1.
+
+### 1.3 Check for non-standard behaviours
 
 | Risk | What to check |
 |------|---------------|
@@ -87,7 +161,7 @@ Confirm the token contract supports at least these standard functions:
 | **Rebasing / elastic supply** | Does the token's supply adjust periodically (e.g., stETH-like rebasing)? The vault stores fixed `i128` balances and does **not** rebase. **Do not onboard** rebasing tokens. |
 | **Missing `decimals` function** | Some early Stellar tokens may not expose `decimals()`. These are incompatible. |
 
-### 1.3 Confirm vault can receive the token
+### 1.4 Confirm vault can receive the token
 
 Deploy a throwaway test script or use the Soroban CLI to call `transfer` from a
 test account to the vault contract address. Confirm the vault's `balanceOf`

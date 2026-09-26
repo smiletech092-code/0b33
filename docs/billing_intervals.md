@@ -8,16 +8,69 @@ How `charge_subscription` validates and enforces timing between charges.
 
 | Bound | Value | Constant |
 |-------|-------|----------|
-| Minimum | 60 s (1 minute) | `MIN_SUBSCRIPTION_INTERVAL_SECONDS` |
-| Maximum | 31 536 000 s (365 days) | `MAX_SUBSCRIPTION_INTERVAL_SECONDS` |
+| Minimum (enforced) | 60 s (1 minute) | `MIN_SUBSCRIPTION_INTERVAL_SECONDS` |
+| Maximum (enforced) | 31 536 000 s (365 days) | `MAX_SUBSCRIPTION_INTERVAL_SECONDS` |
+| Ledger close time (network) | ~5 s | — |
 
 `interval_seconds = 0` is implicitly rejected because zero is below the minimum.
+It is additionally rejected by the dedicated guard
+`validation::reject_zero_interval`, which runs first so the zero case always
+reports the same error regardless of which bound it would otherwise trip.
 
 Validation is performed by the single authoritative helper `validate_interval(interval_seconds)` at every entry point that persists an interval:
 
 - `create_subscription` / `create_subscription_with_token`
 - `create_plan_template` / `create_plan_template_with_token`
 - `update_plan_template`
+
+### Why the minimum is 60 seconds, not 5 or 10
+
+Stellar ledgers close roughly every **5 seconds** on Testnet and Futurenet
+(the target ~5 s close time is a protocol parameter, so treat it as an
+approximation, not a guarantee). That is the number that makes sub-minute
+intervals look attractive: a 10-second interval is only two ledger closes.
+
+Two or three ledger closes is *not* a safe billing period, and the reason is
+not precision — it is the interaction between interval length, ledger close
+scheduling, and the charge guard `now >= last_payment + interval_seconds`:
+
+| Concern | Why a sub-minute interval fails |
+|---------|----------------------------------|
+| **Clock granularity** | `env.ledger().timestamp()` has one-second resolution but advances in ~5 s steps. A 5 s or 10 s interval lands on the same coarse grid as the ledger itself, so "when is the charge due" becomes indistinguishable from "which ledger am I in". |
+| **Boundary flapping** | With an interval close to the close time, a charge that lands one ledger early fails with `IntervalNotElapsed` and the next attempt may be a whole ledger later. Retries then alternate between `IntervalNotElapsed` and success. |
+| **Batch amplification** | `batch_charge` processes ids sequentially. Sub-minute intervals make far more subscriptions eligible per billing run, so a single admin transaction can exceed the network instruction budget. See [`batch_charge.md`](batch_charge.md#maximum-batch-size). |
+| **Ledger-close backpressure** | A ledger that overruns delays the next close. Under load a nominal 5 s close can stretch well past 5 s, so any interval sized against exactly one close is undersized in practice. |
+| **Fee rounding** | Fees are applied per charge. Charging on a short cycle multiplies the number of rounding events, and small per-charge amounts can round toward zero. See [`safe_math.md`](safe_math.md). |
+
+At 60 s the interval spans roughly **12 average ledger closes**, which leaves
+substantial headroom against a stretched close, and keeps a subscription's
+charge rate to at most once per 12 ledgers. The enforced minimum is therefore
+roughly **an order of magnitude above the 1–2 ledger-close floor** — high
+enough that a normal close-time overrun cannot make a due charge look
+not-yet-eligible.
+
+### Guidance for integrators
+
+| Category | Value | Contract behaviour |
+|----------|-------|--------------------|
+| **Recommended** | ≥ 3 600 s (1 hour) | Accepted. Normalises ledger-close jitter and keeps per-charge fees above rounding thresholds. |
+| **Acceptable** | 60 s – 3 599 s | Accepted. Fine for short-cycle or usage-heavy plans; expect some `IntervalNotElapsed` results on tight retry loops. |
+| **Rejected** | 1 s – 59 s (sub-minute) | `Error::InvalidInput` (code `3002`) at creation/update. Even though 5–10 s spans 1–2 ledger closes, the contract refuses it. |
+| **Rejected** | `0` | `Error::InvalidInput` (code `3002`). |
+
+⚠ **Sub-minute intervals are rejected outright.** `validate_interval` applies
+the bounds before the subscription is ever written, so the rejection happens
+at `create_subscription` / `update_plan_template` time — not at charge time.
+A plan that needs sub-minute billing must model it as a usage-metered
+subscription (see [`usage_billing.md`](usage_billing.md)) charged via
+`charge_usage` on demand, rather than as an interval charge.
+
+The minimum is enforced in two layers:
+
+1. `validation::reject_zero_interval` — the authoritative zero guard.
+2. `validate_interval` in `subscription.rs` — the range check that calls (1)
+   first and then compares against `MIN_SUBSCRIPTION_INTERVAL_SECONDS` and
+   `MAX_SUBSCRIPTION_INTERVAL_SECONDS`.
 
 ---
 

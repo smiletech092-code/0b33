@@ -264,6 +264,12 @@ fn apply_metadata_value(
         return Err(Error::MetadataValueTooLong);
     }
 
+    // UTF-8 validation for key and value to prevent corruption of off-chain indexers
+    // that parse event payloads as UTF-8. soroban_sdk::String should contain valid UTF-8,
+    // but we validate explicitly to ensure data integrity.
+    validate_utf8_string(key, "metadata key")?;
+    validate_utf8_string(value, "metadata value")?;
+
     let mut keys: Vec<String> = env
         .storage()
         .persistent()
@@ -381,6 +387,91 @@ pub fn list_metadata_keys(env: &Env, subscription_id: u32) -> Result<Vec<String>
         .unwrap_or(Vec::new(env));
 
     Ok(keys)
+}
+
+/// Validates that a soroban_sdk::String contains valid UTF-8 byte sequences.
+/// 
+/// While soroban_sdk::String should theoretically contain valid UTF-8, this explicit
+/// validation prevents malformed byte sequences from corrupting off-chain indexers
+/// that parse event payloads as UTF-8.
+///
+/// # Arguments
+/// * `s` - The string to validate
+/// * `field_name` - Human-readable field name for error context
+///
+/// # Errors
+/// * `Error::InvalidInput` - If the string contains invalid UTF-8 sequences
+fn validate_utf8_string(s: &String, _field_name: &str) -> Result<(), Error> {
+    // Reject empty strings up front.
+    if s.len() == 0 {
+        return Err(Error::InvalidInput);
+    }
+
+    // Validate the raw bytes with Rust's standard UTF-8 decoder (issue #149 /
+    // #189) rather than a manual byte-range check, so valid multi-byte
+    // sequences (CJK, emoji, accented Latin, ...) are accepted.
+    let len = s.len() as usize;
+    let mut raw = vec![0u8; len];
+    s.copy_into_slice(&mut raw);
+    let text = core::str::from_utf8(&raw).map_err(|_| Error::InvalidInput)?;
+
+    // Reject control characters (except tab/newline/CR) and require at least
+    // one printable, non-whitespace character.
+    let mut has_non_control_char = false;
+    for byte in text.bytes() {
+        if byte < 32 && byte != 9 && byte != 10 && byte != 13 {
+            return Err(Error::InvalidInput);
+        }
+        if byte >= 32 {
+            has_non_control_char = true;
+        }
+    }
+    if !has_non_control_char {
+        return Err(Error::InvalidInput);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod utf8_validation_tests {
+    use super::*;
+    use soroban_sdk::{Env, String};
+
+    #[test]
+    fn accepts_cjk_metadata_values() {
+        let env = Env::default();
+        let value = String::from_str(&env, "日本語のマーチャント名");
+        assert!(validate_utf8_string(&value, "metadata value").is_ok());
+    }
+
+    #[test]
+    fn accepts_accented_and_emoji_values() {
+        let env = Env::default();
+        let value = String::from_str(&env, "héllo wørld 🚀");
+        assert!(validate_utf8_string(&value, "metadata value").is_ok());
+    }
+
+    #[test]
+    fn accepts_cjk_metadata_keys() {
+        let env = Env::default();
+        let key = String::from_str(&env, "名前");
+        assert!(validate_utf8_string(&key, "metadata key").is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_values() {
+        let env = Env::default();
+        let empty = String::from_str(&env, "");
+        assert!(validate_utf8_string(&empty, "metadata value").is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace_only_values() {
+        let env = Env::default();
+        let spaces = String::from_str(&env, "   ");
+        assert!(validate_utf8_string(&spaces, "metadata value").is_err());
+    }
 }
 
 #[cfg(test)]

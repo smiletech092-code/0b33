@@ -138,7 +138,7 @@ fn setup_env<'a>() -> (
         );
         sub_ids.push(sub_id);
 
-        vault.deposit_funds(&sub_id, &sub, &50_000, &None);
+        vault.deposit_funds(&sub_id, &50_000, &None);
     }
 
     (
@@ -172,7 +172,7 @@ proptest! {
                 Op::Deposit { sub_idx, amount } => {
                     let sub_id = sub_ids[sub_idx];
                     let subscriber = &subscribers[sub_idx];
-                    let _ = vault.try_deposit_funds(&sub_id, subscriber, &amount, &None);
+                    let _ = vault.try_deposit_funds(&sub_id, &amount, &None);
                 }
                 Op::ChargeInterval { sub_idx } => {
                     let sub_id = sub_ids[sub_idx];

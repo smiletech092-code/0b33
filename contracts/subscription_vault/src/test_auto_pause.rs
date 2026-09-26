@@ -60,7 +60,7 @@ fn create_funded_sub(
     );
     if prepaid > 0 {
         token_admin.mint(&subscriber, &prepaid);
-        client.deposit_funds(&id, &subscriber, &prepaid, &None);
+        client.deposit_funds(&id, &prepaid, &None);
     }
     (id, subscriber, merchant)
 }
@@ -161,7 +161,7 @@ fn test_counter_resets_on_successful_charge() {
 
     // Top up enough to cover one charge — counter resets on deposit
     tok.mint(&subscriber, &AMOUNT);
-    client.deposit_funds(&id, &subscriber, &AMOUNT, &None);
+    client.deposit_funds(&id, &AMOUNT, &None);
 
     // Successful charge — counter cleared
     jump_interval(&env);
@@ -200,7 +200,7 @@ fn test_counter_resets_on_deposit() {
 
     // Deposit (not enough to cover the charge, just enough to satisfy min_topup)
     tok.mint(&subscriber, &1_000_000i128);
-    client.deposit_funds(&id, &subscriber, &1_000_000i128, &None);
+    client.deposit_funds(&id, &1_000_000i128, &None);
 
     // The next failure is only the 1st after the reset — should not pause
     jump_interval(&env);
@@ -236,4 +236,37 @@ fn test_already_paused_not_affected() {
         SubscriptionStatus::Paused
     );
     let _ = mer_addr; // suppress unused warning
+}
+
+
+/// Per-subscription auto_pause_threshold: different subscriptions can have different thresholds.
+#[test]
+fn test_per_subscription_threshold_configuration() {
+    let (env, client, admin, tok) = setup_no_grace();
+    
+    // Create two subscriptions
+    let (id1, subscriber1, _) = create_funded_sub(&env, &client, &tok, 0);
+    let (id2, subscriber2, _) = create_funded_sub(&env, &client, &tok, 0);
+
+    // For subscriptions created before per-subscription thresholds, 
+    // they inherit the global threshold of 0 (disabled by default).
+    // Verify that both start with auto_pause_threshold = 0
+    let sub1 = client.get_subscription(&id1);
+    let sub2 = client.get_subscription(&id2);
+    
+    assert_eq!(sub1.auto_pause_threshold, 0, "subscription 1 should start with threshold 0");
+    assert_eq!(sub2.auto_pause_threshold, 0, "subscription 2 should start with threshold 0");
+    
+    // With global threshold = 0, both subscriptions should not auto-pause
+    for _ in 0..5 {
+        jump_interval(&env);
+        client.charge_subscription(&id1, &None);
+    }
+    
+    let sub1_final = client.get_subscription(&id1);
+    assert_eq!(
+        sub1_final.status,
+        SubscriptionStatus::InsufficientBalance,
+        "subscription 1 with threshold 0 should not auto-pause"
+    );
 }

@@ -110,7 +110,7 @@ fn new_funded_sub<'a>(
         &None,
         &None::<Address>,
     );
-    vault.deposit_funds(&sub_id, subscriber, &50_000i128, &None);
+    vault.deposit_funds(&sub_id, &50_000i128, &None);
     sub_id
 }
 
@@ -151,6 +151,34 @@ fn perf_get_subscription_direct_lookup() {
     assert!(
         report("get_subscription_direct", elapsed_ms, BUDGET_GET_SUB_MS),
         "[Perf] get_subscription_direct exceeded budget: {elapsed_ms}ms > {BUDGET_GET_SUB_MS}ms"
+    );
+    assert_eq!(sub.subscriber, subscriber, "returned wrong subscriber");
+    assert_eq!(sub.merchant, merchant, "returned wrong merchant");
+}
+
+/// O(1) direct lookup near the TTL extension threshold.
+///
+/// Reads of entries close to TTL expiry trigger the contract's TTL extension
+/// path, which adds storage-write overhead. Time that full read so the
+/// measured latency includes the extension cost.
+#[test]
+fn perf_get_subscription_near_ttl_threshold() {
+    let (env, vault, _token, token_admin, _admin) = make_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let sub_id = new_funded_sub(&env, &vault, &token_admin, &subscriber, &merchant);
+
+    // Age the subscription into the TTL-extension window: near expiry, so the
+    // read must also pay the extension cost.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 30 * 86_400u64 - 1);
+
+    let t0 = Instant::now();
+    let sub = vault.get_subscription(&sub_id);
+    let elapsed_ms = t0.elapsed().as_millis();
+
+    assert!(
+        report("get_subscription_near_ttl_threshold", elapsed_ms, BUDGET_GET_SUB_MS),
+        "[Perf] get_subscription_near_ttl_threshold exceeded budget: {elapsed_ms}ms > {BUDGET_GET_SUB_MS}ms"
     );
     assert_eq!(sub.subscriber, subscriber, "returned wrong subscriber");
     assert_eq!(sub.merchant, merchant, "returned wrong merchant");
@@ -343,7 +371,7 @@ fn perf_list_by_subscriber_paginated() {
             &None,
             &None::<Address>,
         );
-        vault.deposit_funds(&sub_id, &subscriber, &50_000i128, &None);
+        vault.deposit_funds(&sub_id, &50_000i128, &None);
     }
 
     // First page.

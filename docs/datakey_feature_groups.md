@@ -15,6 +15,8 @@ readability win **without** moving a single variant:
 | Subscription | `SubscriptionKey` | Per-subscription lifecycle, replay/idempotency, metering, metadata, per-subscriber caps and escrow |
 | Merchant | `MerchantKey` | Merchant config, earnings and balances, payout schedule, multi-sig, compliance tags, fee overrides |
 | Governance | `GovernanceKey` | Admin/operator authority, protocol fee and treasury policy, guardian proposals, emergency stop, schema version |
+| Coupon | `CouponKey` | Coupon records, global redemption counters, per-subscription coupon-redemption flags |
+| Dispute | `DisputeKey` | Dispute records, escrow ledgers, the dispute ID counter, and the per-subscription active-dispute index |
 
 ## How drift is prevented
 
@@ -47,5 +49,11 @@ On top of that it asserts:
   `PendingTreasuryChange` is grouped, so the disjointness assertion states a
   true invariant. Resolving that collision changes live storage semantics and is
   a maintainer decision, not something this PR should quietly rewrite.
+- **`CouponKey` covers four persistent keys** — `Coupon` (56), `CouponRedemptions` (57),
+  and `SubCouponRedeemed` (69). `SubCoupon` (68) is grouped under `SubscriptionKey`
+  because it is per-subscription lifecycle data, while the other three are
+  coupon-lifecycle data owned by the coupon system.
+- **`DisputeKey` covers four instance/persistent keys** — `DisputeEscrow` (49),
+  `Dispute` (50), `NextDisputeId` (51), `SubscriptionDispute` (52).
 - Arms whose payloads cannot be built from a bare `Env` without unrelated test
   fixtures are left for a follow-up.

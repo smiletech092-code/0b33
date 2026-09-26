@@ -3,6 +3,15 @@
 This document describes the migration-friendly hooks added to the contract to support
 future upgrades while preserving security and minimizing risk.
 
+## Contents
+
+- [Schema version migration](#schema-version-migration)
+- [Rollback and downgrade](#rollback-and-downgrade)
+- [Export hooks](#export-hooks)
+- [Control and authorization](#control-and-authorization)
+- [Suggested migration flow](#suggested-migration-flow)
+- [Security and limitations](#security-and-limitations)
+
 ## Goals and scope
 
 - Provide **admin-only**, **read-only** export hooks for contract and subscription state.
@@ -66,6 +75,96 @@ Each arm must be self-contained and must not assume any prior arm ran in the sam
   No token transfers, subscription mutations, or balance changes occur.
 - **Audit trail:** every successful upgrade emits a `SchemaMigratedEvent` with the
   admin address, version pair, and ledger timestamp.
+
+## Rollback and downgrade
+
+### Rollback hooks are not supported
+
+The contract does not implement rollback hooks. Schema migrations are **forward-only**.
+This is a deliberate design decision, not an oversight.
+
+#### Rationale
+
+Soroban's `#[contracttype]` serialization is **positional**: each field in a struct maps to
+a fixed slot in the XDR encoding. A forward migration step (e.g. v3 → v4) rewrites every
+`DataKey::Sub(id)` record on-chain so that the new field layout deserializes correctly for
+the upgraded binary. There is no safe, general-purpose way to reverse that rewrite:
+
+- The old field layout is gone from the binary — the v3 deserializer no longer exists in the
+  v4 WASM.
+- Subscription records rewritten by the upgrade step cannot be decoded by the previous binary
+  without access to the old struct definition, which is not retained.
+- Re-deploying the old WASM and calling `migrate()` would immediately trigger
+  `SchemaMigrationDowngrade` (code `9101`) and be rejected before touching any state.
+
+Attempting a rollback by force (e.g. re-uploading old WASM without calling `migrate()`) would
+leave the stored `SchemaVersion` higher than the binary constant, causing every entrypoint that
+reads migrated storage keys to panic on deserialization.
+
+#### `SchemaMigrationDowngrade` (code `9101`)
+
+This error is the contract's primary rollback guard. It is raised at the very start of
+`migrate()` (and `migrate_config_to_persistent()`) before any state is touched:
+
+```rust
+// contracts/subscription_vault/src/admin.rs — do_migrate
+let stored_version = get_schema_version(env);
+if stored_version > binary_version {
+    return Err(Error::SchemaMigrationDowngrade);
+}
+```
+
+| Condition | Error | Meaning |
+|-----------|-------|---------|
+| `stored_version > binary_version` | `SchemaMigrationDowngrade` (9101) | On-chain state is newer than the deployed binary. Deploying an old binary and calling `migrate()` is rejected immediately. No state is read or written. |
+| `stored_version != expected` (config migration path) | `SchemaMigrationDowngrade` (9101) | Same guard applied in `migrate_config_to_persistent`. |
+
+See [`docs/errors.md`](errors.md) for the full error table entry and retry guidance.
+
+### Hotfix strategy when a forward migration must be undone
+
+Because rollback is not available at the contract level, the recovery path after a bad
+migration is:
+
+1. **Do not re-deploy the old binary.** It cannot read the migrated storage layout and will
+   panic on any call that touches a rewritten record.
+
+2. **Deploy a new patched binary** at a version higher than the current on-chain version.
+   The patched binary must be able to read the current (migrated) storage layout.
+
+3. **If the migration step introduced a schema bug**, the patch binary should include a new
+   migration arm (e.g. `(4, _) => { fix_up_records(env); current = 5; }`) that corrects the
+   on-chain data in a forward step.
+
+4. **Use `export_contract_snapshot` and `export_subscription_summaries` before deploying a
+   new version** so that if the patch itself needs to be validated, the exported state can be
+   diffed against the post-patch state off-chain.
+
+5. **Activate the emergency stop** (`enable_emergency_stop(admin)`) before deploying a
+   hotfix binary to halt all financial writes while the patch is prepared. Export hooks remain
+   callable during an emergency stop (they are read-only and not gated by the circuit breaker).
+
+### Migration version history and irreversibility
+
+| Upgrade | What was rewritten | Reversible? |
+|---------|--------------------|-------------|
+| v0–v1 → v2 | No data rewrite; version counter bumped | No — v1 binary cannot read v2 instance storage layout |
+| v2 → v3 | `SchemaVersion` moved from instance storage to persistent storage; config keys migrated | No — v2 binary looks for config in instance storage; v3 stores it in persistent storage |
+| v3 → v4 | Every `DataKey::Sub(id)` record rewritten to add `expires_at_ledger: Option<u32>` | No — v3 binary's `Subscription` struct has no `expires_at_ledger` field; deserialization panics |
+| v4 → v5 | Every `DataKey::Sub(id)` record rewritten to add `sub_account_label: Option<Symbol>` | No — v4 binary's struct has no `sub_account_label` field; deserialization panics |
+
+### Golden fixtures as a rollback safety net
+
+Although schema rollback is unsupported, the golden regression test suite
+(`contracts/subscription_vault/tests/migration_goldens.rs`) provides bit-perfect snapshot
+comparison across version boundaries. Before any migration is deployed to production:
+
+- Run `cargo test -- --ignored update_goldens` to capture the pre-migration snapshot.
+- After migration, diff old and new golden fixtures to verify only the expected fields changed.
+- If the diff is unexpected, abort and prepare a hotfix binary rather than attempting to
+  redeploy the old one.
+
+---
 
 ## Export hooks
 

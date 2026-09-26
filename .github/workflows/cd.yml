@@ -7,46 +7,48 @@ on:
 
 permissions:
   contents: write
+  attestations: read
 
 jobs:
   release:
     name: Build and Release
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4.2.2
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-
-      - name: Add WASM target
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Cache cargo
-        uses: actions/cache@v4.2.2
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Build WASM
-        run: cargo build -p subscription_vault --target wasm32-unknown-unknown --release
-
-      - name: Set WASM path
+      - name: Download CI-built WASM
         id: wasm
         run: |
-          WASM_PATH=target/wasm32-unknown-unknown/release/subscription_vault.wasm
+          set -euo pipefail
+          CI_RUN_ID=$(gh run list \
+            --workflow ci.yml \
+            --commit "$GITHUB_SHA" \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+          if [ -z "$CI_RUN_ID" ] || [ "$CI_RUN_ID" = "null" ]; then
+            echo "No successful CI run found for $GITHUB_SHA"
+            exit 1
+          fi
+          gh run download "$CI_RUN_ID" --name subscription-vault-wasm --dir attested-wasm
+          WASM_PATH=attested-wasm/subscription_vault.wasm
           if [ ! -f "$WASM_PATH" ]; then
-            echo "WASM not found at $WASM_PATH, listing:"
-            ls -la target/wasm32-unknown-unknown/release/ || true
+            echo "Attested WASM not found at $WASM_PATH"
+            find attested-wasm -maxdepth 2 -type f -print || true
             exit 1
           fi
           echo "path=$WASM_PATH" >> $GITHUB_OUTPUT
+
+      - name: Verify WASM build attestation
+        run: |
+          set -euo pipefail
+          gh attestation verify "${{ steps.wasm.outputs.path }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml"
+          sha256sum "${{ steps.wasm.outputs.path }}"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

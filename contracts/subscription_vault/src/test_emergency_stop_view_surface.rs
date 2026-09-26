@@ -68,12 +68,8 @@ fn setup_full() -> (
         &None::<soroban_sdk::Symbol>,
     );
 
-    client.deposit_funds(
-        &sub_id,
-        &subscriber,
-        &DEPOSIT,
-        &None::<soroban_sdk::BytesN<32>>,
-    );
+    client.deposit_funds(&sub_id, &DEPOSIT,
+        &None::<soroban_sdk::BytesN<32>>,);
 
     (env, client, token, admin, subscriber, merchant, sub_id)
 }

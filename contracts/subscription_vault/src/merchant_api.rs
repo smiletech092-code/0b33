@@ -41,6 +41,21 @@
 //! | `set_merchant_multisig` | [`crate::merchant::set_merchant_multisig`] |
 //! | `get_merchant_multisig_config` | [`crate::merchant::get_merchant_multisig_config`] |
 //!
+//! ### Config mutability guard
+//!
+//! `update_merchant_config` is **not** an unconstrained field setter.
+//! `fee_bips` and `allowed_operations` are protected and require the merchant
+//! to have zero `Active` subscriptions; supplying either while live
+//! subscriptions exist returns `Error::InvalidStatusTransition` and writes
+//! nothing. The check and its rationale live with the delegate functions in
+//! [`crate::merchant`] (`count_active_subscriptions`,
+//! `reject_protected_field_change`); the per-field table is in
+//! `docs/merchant_config.md` → Field mutability.
+//!
+//! Note the ABI-stability rule above: this guard lives in `merchant.rs`, not
+//! here, because this module defines no entrypoints. Adding the check to this
+//! file would have no effect on the compiled contract.
+//!
 //! ## Pause / Unpause
 //! | Entrypoint | Delegate |
 //! |---|---|
@@ -91,6 +106,7 @@
 //! | Entrypoint | Delegate |
 //! |---|---|
 //! | `get_subscriptions_by_merchant` | [`crate::queries::get_subscriptions_by_merchant`] |
+//! | `get_subscriptions_by_merchant_paginated` | [`crate::queries::get_subscriptions_by_merchant_paginated`] |
 //! | `get_merchant_subscription_count` | [`crate::queries::get_merchant_subscription_count`] |
 //! | `get_merchant_max_subs` | [`crate::queries::get_merchant_max_subs`] |
 //! | `set_merchant_max_subs` | [`crate::subscription::do_set_merchant_max_subs`] |
@@ -113,7 +129,8 @@ pub use crate::merchant::{
 };
 pub use crate::queries::{
     generate_reconciliation_proof, get_contract_reconciliation_summary, get_merchant_max_subs,
-    get_merchant_subscription_count, get_subscriptions_by_merchant, get_token_reconciliation,
+    get_merchant_subscription_count, get_subscriptions_by_merchant,
+    get_subscriptions_by_merchant_paginated, get_token_reconciliation,
     query_prepaid_balances_paginated,
 };
 pub use crate::subscription::do_set_merchant_max_subs;

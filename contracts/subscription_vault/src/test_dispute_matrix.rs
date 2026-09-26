@@ -1,4 +1,4 @@
-//! Exhaustive tests for the dispute lifecycle transition matrix.
+﻿//! Exhaustive tests for the dispute lifecycle transition matrix.
 
 use crate::{
     test_utils::{fixtures, setup::TestEnv},
@@ -227,14 +227,14 @@ fn test_dispute_transition_matrix_rejects_missing_dispute() {
     );
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Dispute escrow overpay invariant — audit #636
+// ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+// Dispute escrow overpay invariant ΓÇö audit #636
 //
 // Verifies that dispute resolution can never disburse more than the original
 // escrowed amount, even in edge cases involving partial resolutions, rounding,
 // or re-opened disputes. The DisputeEscrowLedger tracks cumulative disbursements
 // and the resolve entrypoint enforces total_disbursed <= original_amount.
-// ══════════════════════════════════════════════════════════════════════════════
+// ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
 
 mod dispute_overpay_invariant {
     use crate::{
@@ -332,7 +332,7 @@ mod dispute_overpay_invariant {
         );
         assert!(result_1.is_ok(), "first full resolution must succeed");
 
-        // Second resolve must fail — dispute is already resolved
+        // Second resolve must fail ΓÇö dispute is already resolved
         let result_2 = test_env.client.try_resolve_dispute(
             &test_env.admin,
             &dispute_id,
@@ -346,7 +346,7 @@ mod dispute_overpay_invariant {
     }
 
     /// Simulate a ledger state where total_disbursed > 0 but escrow hasn't
-    /// been cleaned up, then try to resolve again — the ledger guard must
+    /// been cleaned up, then try to resolve again ΓÇö the ledger guard must
     /// prevent overpay.
     #[test]
     fn overpay_rejected_with_partial_disbursement_state() {
@@ -372,7 +372,7 @@ mod dispute_overpay_invariant {
             "resolve of remaining half after partial must succeed"
         );
 
-        // Now try again — no remaining funds should fail
+        // Now try again ΓÇö no remaining funds should fail
         let result2 = simulate_partial_resolution_then_resolve(
             &test_env,
             dispute_id,
@@ -428,7 +428,7 @@ mod dispute_overpay_invariant {
     }
 
     /// Re-open a dispute on the same subscription after the first is resolved,
-    /// then resolve — must work and must not leak escrow state from the
+    /// then resolve ΓÇö must work and must not leak escrow state from the
     /// previous dispute.
     #[test]
     fn re_open_dispute_after_resolve() {

@@ -1,6 +1,9 @@
-# Stellabill Contracts
+# Stellabill Contracts ....
+
 
 Soroban smart contracts for **Stellabill** — prepaid USDC subscription billing on the Stellar network. This repository contains the on-chain logic for recurring payments, subscriber vaults, and merchant payouts.
+
+For a runnable off-chain example, see the [reference event indexer](docs/indexer_reference.md), which captures Soroban contract events in a local SQLite database.
 
 ---
 
@@ -154,7 +157,6 @@ The installer is **idempotent** — safe to run repeatedly. It:
 1. Sets the executable bit on all scripts under `.githooks/`.
 2. Runs `git config core.hooksPath .githooks` (no global config changes).
 3. Smoke-tests the hook to confirm it exits 0.
-
 After installation, every `git commit` automatically runs:
 
 | Check | Command | Scope |
@@ -211,6 +213,23 @@ building the contract, starting a local Soroban network (via Docker
 The script creates three test identities (`admin`, `subscriber`, `merchant`),
 wraps the native Stellar asset as a test token, and validates the deployment
 by creating, funding, and charging a subscription.
+
+### Error table generation
+
+[`scripts/generate_error_table.py`](scripts/generate_error_table.py) is a code-generation utility that produces the canonical error-code cross-reference table by:
+
+1. Parsing `contracts/subscription_vault/src/types.rs` to extract error variants and numeric codes.
+2. Grepping all `.rs` source files to identify which contract entrypoints emit each error.
+3. Splicing the generated table into the "## Entrypoint Cross-Reference" section of [`docs/errors.md`](docs/errors.md).
+
+**Usage:**
+
+```bash
+python scripts/generate_error_table.py       # Generate and update docs/errors.md in-place
+python scripts/generate_error_table.py --check # Check mode: fail if docs/errors.md would change (used by CI)
+```
+
+The generator is deterministic; when run without changes to the error enum or emitting code, it produces no output diff. The generated table is committed to the repository as the single source of truth for error codes and recommended client retry handling.
 
 ---
 

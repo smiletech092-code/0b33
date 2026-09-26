@@ -865,9 +865,9 @@ fn cross_domain_nonce_does_not_collide() {
     // `(admin, DOMAIN_ADMIN_ROTATION)` counters. Tag-only collision check:
     // domain 3 is registered for metadata.
     use crate::nonce::{DOMAIN_ADMIN_ROTATION, DOMAIN_BATCH_CHARGE, DOMAIN_METADATA_SIGNED};
-    assert_eq!(DOMAIN_BATCH_CHARGE, 0);
-    assert_eq!(DOMAIN_ADMIN_ROTATION, 1);
-    assert_eq!(DOMAIN_METADATA_SIGNED, 3);
+    assert_eq!(DOMAIN_BATCH_CHARGE.as_u32(), 0);
+    assert_eq!(DOMAIN_ADMIN_ROTATION.as_u32(), 1);
+    assert_eq!(DOMAIN_METADATA_SIGNED.as_u32(), 3);
 }
 
 #[test]
@@ -899,7 +899,7 @@ fn nonce_overflow_is_guarded() {
         crate::nonce::check_and_advance(&env, &signer, crate::nonce::DOMAIN_METADATA_SIGNED, 1)
             .expect("second consume ok");
         env.storage().persistent().set(
-            &crate::DataKey::AdminNonce(signer.clone(), crate::nonce::DOMAIN_METADATA_SIGNED),
+            &crate::DataKey::AdminNonce(signer.clone(), crate::nonce::DOMAIN_METADATA_SIGNED.as_u32()),
             &u64::MAX,
         );
         let res = crate::nonce::check_and_advance(
